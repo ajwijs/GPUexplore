@@ -329,54 +329,54 @@ __device__ inttype FINDORPUT_SINGLE(inttype* t, inttype* d_q, inttype bi, inttyp
 }
 
 // find or put element, warp version. t is element stored in block cache
-#define FINDORPUT_WARP(a, t)				{	(a) = 0; \
-												for (bi = 0; bi < NR_HASH_FUNCTIONS; bi++) { \
-													HASHFUNCTION(bitmask, bi, (t)); \
-													bl = d_q[bitmask+LANE]; \
-													bk = __ballot(STRIPPEDSTATE(&bl, 0) == STRIPPEDSTATE((t), ENTRY_ID)); \
-													if (LANEPOINTSTOVALIDBUCKETPOS) { \
-														(a) = 0; \
-														SETBITS(LANE-ENTRY_ID, LANE-ENTRY_ID+d_sv_nints-1, (a)); \
-														if (bk & (a) == (a)) { \
-															if (ENTRY_ID == d_sv_nints-1) { \
-																SETOLDCACHEINT((t)[ENTRY_ID]); \
-															} \
-														} \
-													} \
-													(a) = 0; \
-													if (!ISOLDCACHEINT((t)[d_sv_nints-1])) { \
-														for (bj = 0; bj < NREL_IN_BUCKET; bj++) { \
-															if (LANE_POINTS_TO_EL(bj)) { \
-																bk = atomicCAS(&d_q[bitmask+LANE], EMPTYVECT32, (t)[ENTRY_ID]); \
-																if (bk == EMPTYVECT32) { \
-																	if (ENTRY_ID == 0) { \
-																		SETOLDCACHEINT((t)[d_sv_nints-1]); \
-																	} \
-																	if (ITERATIONS < d_kernel_iters-1) { \
-																		if (ENTRY_ID == 0) { \
-																			bk = atomicAdd((inttype *) &OPENTILECOUNT, d_sv_nints); \
-																			if (bk < OPENTILELEN) { \
-																				d_q[bitmask+LANE+(d_sv_nints-1)] = (t)[d_sv_nints-1]; \
-																			} \
-																		} \
-																		bk = __shfl(bk, LANE-ENTRY_ID); \
-																		if (bk < OPENTILELEN) { \
-																			shared[OPENTILEOFFSET+bk+ENTRY_ID] = NEWSTATEPART((t), ENTRY_ID); \
-																		} \
-																	} \
-																} \
-															} \
-															if (ISOLDCACHEINT((t)[d_sv_nints-1])) { \
-																break; \
-															} \
-														} \
-													} \
-													if (ISOLDCACHEINT((t)[d_sv_nints-1])) { \
-														(a) = 1; \
-														break; \
-													} \
-												} \
-											}
+__device__ inttype FINDORPUT_WARP(inttype* t, inttype* d_q, inttype bi, inttype bj, inttype bk, inttype bl, inttype bitmask, inttype hashtmp) {
+	for (bi = 0; bi < NR_HASH_FUNCTIONS; bi++) {
+		HASHFUNCTION(bitmask, bi, t);
+		bl = d_q[bitmask+LANE];
+		bk = __ballot(STRIPPEDSTATE(&bl, 0) == STRIPPEDSTATE(t, ENTRY_ID));
+		if (LANEPOINTSTOVALIDBUCKETPOS) {
+			hashtmp = 0;
+			SETBITS(LANE-ENTRY_ID, LANE-ENTRY_ID+d_sv_nints-1, hashtmp);
+			if (bk & hashtmp == hashtmp) {
+				if (ENTRY_ID == d_sv_nints-1) {
+					SETOLDCACHEINT(t[ENTRY_ID]);
+				}
+			}
+		}
+		hashtmp = 0;
+		if (!ISOLDCACHEINT(t[d_sv_nints-1])) {
+			for (bj = 0; bj < NREL_IN_BUCKET; bj++) {
+				if (LANE_POINTS_TO_EL(bj)) {
+					bk = atomicCAS(&d_q[bitmask+LANE], EMPTYVECT32, t[ENTRY_ID]);
+					if (bk == EMPTYVECT32) {
+						if (ENTRY_ID == 0) {
+							SETOLDCACHEINT(t[d_sv_nints-1]);
+						}
+						if (ITERATIONS < d_kernel_iters-1) {
+							if (ENTRY_ID == 0) {
+								bk = atomicAdd((inttype *) &OPENTILECOUNT, d_sv_nints);
+								if (bk < OPENTILELEN) {
+									d_q[bitmask+LANE+(d_sv_nints-1)] = t[d_sv_nints-1];
+								}
+							}
+							bk = __shfl(bk, LANE-ENTRY_ID);
+							if (bk < OPENTILELEN) {
+								shared[OPENTILEOFFSET+bk+ENTRY_ID] = NEWSTATEPART(t, ENTRY_ID);
+							}
+						}
+					}
+				}
+				if (ISOLDCACHEINT((t)[d_sv_nints-1])) {
+					return 1;
+				}
+			}
+		}
+		if (ISOLDCACHEINT((t)[d_sv_nints-1])) {
+			return 1;
+		}
+	}
+	return 0;
+}
 
 // macro to print state vector
 //#define PRINTVECTOR(s) 							{	printf ("("); \
@@ -1088,8 +1088,7 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		for (i = WARP_ID; i < k; i += (blockDim.x/WARPSIZE)) {
 			if (ISNEWSTATE(&shared[CACHEOFFSET+(i*d_sv_nints)])) {
 				// look for the state in the global hash table
-				FINDORPUT_WARP(l, &shared[CACHEOFFSET+(i*d_sv_nints)]);
-				if (l == 0) {
+				if (FINDORPUT_WARP((inttype *) &shared[CACHEOFFSET+(i*d_sv_nints)], d_q, bi, bj, bk, bl, bitmask, hashtmp) == 0) {
 					// ERROR: hash table is full
 					CONTINUE = 2;
 				}
