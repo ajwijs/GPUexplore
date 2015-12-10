@@ -23,6 +23,8 @@
 // type of indices in hash table
 #define indextype uint64_t
 
+enum BucketEntryStatus { EMPTY, TAKEN, FOUND };
+
 #define MIN(a,b) \
    ({ __typeof__ (a) _a = (a); \
        __typeof__ (b) _b = (b); \
@@ -85,8 +87,11 @@ static const inttype EMPTYVECT32 = 0x7FFFFFFF;
 # define EXPLORATION_DONE 0x7FFFFFFF
 // offset in shared memory from which loaded data can be read
 static const int SH_OFFSET = 3;
-static const int KERNEL_ITERS = 10;
-static const int NR_OF_BLOCKS = 3120;
+//static const int KERNEL_ITERS = 10;
+//static const int NR_OF_BLOCKS = 3120;
+//static const int BLOCK_SIZE = 512;
+static const int KERNEL_ITERS = 1;
+static const int NR_OF_BLOCKS = 1;
 static const int BLOCK_SIZE = 512;
 const size_t Mb = 1<<20;
 
@@ -109,7 +114,7 @@ const size_t Mb = 1<<20;
 #define CACHEOFFSET 					(SH_OFFSET+HASHCONSTANTSLEN+VECTORPOSLEN+LTSSTATESIZELEN+OPENTILELEN+THREADBUFFERLEN)
 
 // parameter is thread id
-#define THREADBUFFERGROUPSTART(i)		THREADBUFFEROFFSET+(((i) / d_nr_procs)*(1+(d_nr_procs*d_max_buf_ints)))
+#define THREADBUFFERGROUPSTART(i)		(THREADBUFFEROFFSET+(((i) / d_nr_procs)*(1+(d_nr_procs*d_max_buf_ints))))
 // parameter is group id
 #define THREADBUFFERGROUPPOS(i, j)		shared[THREADBUFFERGROUPSTART(threadIdx.x)+1+((i)*d_max_buf_ints)+(j)]
 #define THREADGROUPCOUNTER				shared[(THREADBUFFERGROUPSTART(threadIdx.x))]
@@ -182,7 +187,9 @@ const size_t Mb = 1<<20;
 #define OLDINT(t)								((t) & 0x7FFFFFFF)
 #define NEWINT(t)								((t) | 0x80000000)
 #define STRIPSTATE(t)							{(t)[(d_sv_nints-1)] = (t)[(d_sv_nints-1)] & 0x7FFFFFFF;}
-#define STRIPPEDSTATE(t, i)						((i == d_sv_nints-1) ? (t[i] & 0x7FFFFFFF) : t[i])
+#define STRIPPEDSTATE(t, i)						((i == d_sv_nints-1) ? ((t)[i] & 0x7FFFFFFF) : (t)[i])
+#define STRIPPEDENTRY(t, i)						((i == d_sv_nints-1) ? ((t) & 0x7FFFFFFF) : (t))
+#define STRIPPEDENTRY_HOST(t, i)				((i == sv_nints-1) ? ((t) & 0x7FFFFFFF) : (t))
 #define NEWSTATEPART(t, i)						(((i) == d_sv_nints-1) ? ((t)[d_sv_nints-1] | 0x80000000) : (t)[(i)])
 #define COMPAREENTRIES(t1, t2)					(((t1) & 0x7FFFFFFF) == ((t2) & 0x7FFFFFFF))
 #define OWNSSYNCRULE(a, t, i)					{if (GETBIT((i),(t))) { \
@@ -277,16 +284,24 @@ __device__ inttype STOREINCACHE(inttype* t, inttype* d_q, inttype bi, inttype bj
 
 #define COMPAREVECTORS(a, t1, t2)				{	(a) = 1; \
 													for (bk = 0; bk < d_sv_nints-1; bk++) { \
-														if ((t1)[bk] != (t2)[bk]) { \
+														if (STRIPPEDSTATE((t1),bk) != STRIPPEDSTATE((t2),bk)) { \
 															(a) = 0; break; \
 														} \
 													} \
-													if ((a)) { \
-														if (STRIPPEDSTATE((t1),bk) != STRIPPEDSTATE((t2),bk)) { \
-															(a) = 0; \
-														} \
-													} \
 												}
+
+//#define COMPAREVECTORS(a, t1, t2)				{	(a) = 1; \
+//													for (bk = 0; bk < d_sv_nints-1; bk++) { \
+//														if ((t1)[bk] != (t2)[bk]) { \
+//															(a) = 0; break; \
+//														} \
+//													} \
+//													if ((a)) { \
+//														if (STRIPPEDSTATE((t1),bk) != STRIPPEDSTATE((t2),bk)) { \
+//															(a) = 0; \
+//														} \
+//													} \
+//												}
 
 // check if bucket element associated with lane is a valid position to store data
 #define LANEPOINTSTOVALIDBUCKETPOS						(HALFLANE < ((HALFWARPSIZE / d_sv_nints)*d_sv_nints))
@@ -352,15 +367,116 @@ __device__ inttype FINDORPUT_SINGLE(inttype* t, inttype* d_q, inttype bi, inttyp
 }
 
 // find or put element, warp version. t is element stored in block cache
-__device__ inttype FINDORPUT_WARP(inttype* t, inttype* d_q, inttype bi, inttype bj, inttype bk, inttype bl, indextype hashtmp)	{
+__device__ inttype FINDORPUT_WARP(inttype* t, inttype* d_q, inttype bi, inttype bj, inttype bk, inttype bl, inttype bitmask, indextype hashtmp)	{
+	BucketEntryStatus threadstatus;
+	// prepare bitmask once to reason about results of threads in the same (state vector) group
+	bitmask = 0;
+	if (LANEPOINTSTOVALIDBUCKETPOS) {
+		SETBITS(LANE-ENTRY_ID, LANE-ENTRY_ID+d_sv_nints, bitmask);
+	}
+	for (bi = 0; bi < NR_HASH_FUNCTIONS; bi++) {
+		HASHFUNCTION(hashtmp, bi, t);
+		bl = d_q[hashtmp+LANE];
+//		if (t[0] == 167790159) {
+//			PRINTTHREAD(bi, STRIPPEDENTRY(bl, ENTRY_ID));
+//		}
+		bk = __ballot(STRIPPEDENTRY(bl, ENTRY_ID) == STRIPPEDSTATE(t, ENTRY_ID));
+		// threadstatus is used to determine whether full state vector has been found
+		threadstatus = EMPTY;
+//		if (t[0] == 167790159) {
+//			// print outcome
+//			PRINTTHREAD(33, bk);
+//		}
+		if (LANEPOINTSTOVALIDBUCKETPOS) {
+//			if (t[0] == 167790159) {
+//				PRINTTHREAD(bk & bitmask,bitmask);
+//			}
+			if ((bk & bitmask) == bitmask) {
+				//if (t[0] == 167790159) {
+				//	PRINTTHREAD(999,0);
+				//}
+				threadstatus = FOUND;
+			}
+		}
+		if (__ballot(threadstatus == FOUND) != 0) {
+			// state vector has been found in bucket. mark local copy as old.
+			//PRINTTHREAD(55, 0);
+			if (LANE == 0) {
+				SETOLDSTATE(t);
+			}
+			return 1;
+		}
+		// try to find empty position to insert new state vector
+		threadstatus = (bl == EMPTYVECT32 && LANEPOINTSTOVALIDBUCKETPOS) ? EMPTY : TAKEN;
+		// let bk hold the smallest index of an available empty position
+		bk = __ffs(__ballot(threadstatus == EMPTY));
+		while (bk != 0) {
+			// write the state vector
+			bk--;
+			if (LANE >= bk && LANE < bk+d_sv_nints) {
+				bl = atomicCAS(&(d_q[hashtmp+LANE]), EMPTYVECT32, t[ENTRY_ID]);
+				if (bl == EMPTYVECT32) {
+					// success
+					if (ENTRY_ID == d_sv_nints-1) {
+						SETOLDSTATE(t);
+					}
+					if (ITERATIONS < d_kernel_iters-1) {
+						// try to claim the state vector for future work
+						bl = OPENTILELEN;
+						if (ENTRY_ID == d_sv_nints-1) {
+							// try to increment the OPENTILECOUNT counter
+							bl = atomicAdd((inttype *) &OPENTILECOUNT, d_sv_nints);
+							if (bl < OPENTILELEN) {
+								d_q[hashtmp+LANE] = t[d_sv_nints-1];
+							}
+						}
+						// all active threads read the OPENTILECOUNT value of the first thread, and possibly store their part of the vector in the shared memory
+						bl = __shfl(bl, LANE-ENTRY_ID+d_sv_nints-1);
+						if (bl < OPENTILELEN) {
+							// write part of vector to shared memory
+							shared[OPENTILEOFFSET+bl+ENTRY_ID] = NEWSTATEPART(t, ENTRY_ID);
+						}
+					}
+					// write was successful. propagate this to the whole warp by setting threadstatus to FOUND
+					threadstatus = FOUND;
+				}
+				else {
+					// write was not successful. check if the state vector now in place equals the one we are trying to insert
+					bk = __ballot(STRIPPEDENTRY(bl, ENTRY_ID) == STRIPPEDSTATE(t, ENTRY_ID));
+					if ((bk & bitmask) == bitmask) {
+						// state vector has been found in bucket. mark local copy as old.
+						if (LANE == bk) {
+							SETOLDSTATE(t);
+						}
+						// propagate this result to the whole warp
+						threadstatus = FOUND;
+					}
+					else {
+						// state vector is different, and position in bucket is taken
+						threadstatus = TAKEN;
+					}
+				}
+			}
+			// check if the state vector was either encountered or inserted
+			if (__ballot(threadstatus == FOUND) != 0) {
+				return 1;
+			}
+			// recompute bk
+			bk = __ffs(__ballot(threadstatus == EMPTY));
+		}
+	}
+	return 0;
+}
+
+__device__ inttype FINDORPUT_WARP_ORIG(inttype* t, inttype* d_q, inttype bi, inttype bj, inttype bk, inttype bl, inttype bitmask, indextype hashtmp) {
 	for (bi = 0; bi < NR_HASH_FUNCTIONS; bi++) {
 		HASHFUNCTION(hashtmp, bi, t);
 		bl = d_q[hashtmp+LANE];
 		if (ENTRY_ID == (d_sv_nints-1)) {
 			if (bl != EMPTYVECT32) {
-				COMPAREVECTORS(bl, &d_q[hashtmp+LANE-(d_sv_nints-1)], t);
+				COMPAREVECTORS(bl, &d_q[hashtmp+LANE-(d_sv_nints-1)], (t));
 				if (bl) {
-					SETOLDSTATE(t);
+					SETOLDSTATE((t));
 				}
 			}
 		}
@@ -472,7 +588,7 @@ int cudaMallocCount ( void ** ptr,int size) {
 }
 
 //test function to print a given state vector
-void print_statevector(inttype *state, inttype *firstbit_statevector, inttype nr_procs) {
+void print_statevector(inttype *state, inttype *firstbit_statevector, inttype nr_procs, inttype sv_nints) {
 	inttype i, s, bitmask, bi;
 
 	for (i = 0; i < nr_procs; i++) {
@@ -490,6 +606,10 @@ void print_statevector(inttype *state, inttype *firstbit_statevector, inttype nr
 		if (i < (nr_procs-1)) {
 			fprintf (stdout, ",");
 		}
+	}
+	fprintf (stdout, " ");
+	for (i = 0; i < sv_nints; i++) {
+		fprintf (stdout, "%d ", STRIPPEDENTRY_HOST(state[i], i));
 	}
 	fprintf (stdout, "\n");
 }
@@ -510,7 +630,7 @@ void print_queue(inttype *d_q, inttype q_size, inttype *firstbit_statevector, in
 					newcount++;
 					fprintf (stdout, "new: ");
 				}
-				print_statevector(&(q_test[(i*WARPSIZE)+STARTPOS_OF_EL_IN_BUCKET_HOST(j)]), firstbit_statevector, nr_procs);
+				print_statevector(&(q_test[(i*WARPSIZE)+STARTPOS_OF_EL_IN_BUCKET_HOST(j)]), firstbit_statevector, nr_procs, sv_nints);
 			}
 		}
 	}
@@ -525,13 +645,17 @@ void print_local_queue(inttype *q, inttype q_size, inttype *firstbit_statevector
 		for (inttype j = 0; j < NREL_IN_BUCKET_HOST; j++) {
 			if (q[(i*WARPSIZE)+STARTPOS_OF_EL_IN_BUCKET_HOST(j)+(sv_nints-1)] != EMPTYVECT32) {
 				count++;
+
+				if (j == 0) {
+					fprintf (stdout, "-----------\n");
+				}
 				nw = ISNEWSTATE_HOST(&q[(i*WARPSIZE)+STARTPOS_OF_EL_IN_BUCKET_HOST(j)]);
 				if (nw) {
 					newcount++;
 					fprintf (stdout, "new: ");
 					//print_statevector(&(q[(i*WARPSIZE)+(j*sv_nints)]), firstbit_statevector, nr_procs);
 				}
-				print_statevector(&(q[(i*WARPSIZE)+STARTPOS_OF_EL_IN_BUCKET_HOST(j)]), firstbit_statevector, nr_procs);
+				print_statevector(&(q[(i*WARPSIZE)+STARTPOS_OF_EL_IN_BUCKET_HOST(j)]), firstbit_statevector, nr_procs, sv_nints);
 			}
 		}
 	}
@@ -1115,7 +1239,7 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		for (i = WARP_ID; i < k; i += (blockDim.x/WARPSIZE)) {
 			if (ISNEWSTATE(&shared[CACHEOFFSET+(i*d_sv_nints)])) {
 				// look for the state in the global hash table
-				if (FINDORPUT_WARP((inttype*) &shared[CACHEOFFSET+(i*d_sv_nints)], d_q, bi, bj, bk, bl, hashtmp) == 0) {
+				if (FINDORPUT_WARP((inttype*) &shared[CACHEOFFSET+(i*d_sv_nints)], d_q, bi, bj, bk, bl, bitmask, hashtmp) == 0) {
 					// ERROR: hash table is full
 					CONTINUE = 2;
 				}
@@ -1317,10 +1441,27 @@ int main(int argc, char** argv) {
 	}
 
 	// Randomly define the closed set hash functions
-	srand(time(NULL));
-	for (int i = 0; i < NR_HASH_FUNCTIONS*2; i++) {
-		h[i] = rand();
-	}
+//	srand(time(NULL));
+//	for (int i = 0; i < NR_HASH_FUNCTIONS*2; i++) {
+//		h[i] = rand();
+//	}
+	// TODO: make random again
+	h[0] = 483319424;
+	h[1] = 118985421;
+	h[2] = 1287157904;
+	h[3] = 1162380012;
+	h[4] = 1231274815;
+	h[5] = 1344969351;
+	h[6] = 527997957;
+	h[7] = 735456672;
+	h[8] = 1774251664;
+	h[9] = 23102285;
+	h[10] = 2089529600;
+	h[11] = 2083003102;
+	h[12] = 908039861;
+	h[13] = 1913855526;
+	h[14] = 1515282600;
+	h[15] = 1691511413;
 
 	// continue flags
 	contBFS = 1;
@@ -1445,6 +1586,7 @@ int main(int argc, char** argv) {
 	inttype scan = 0;
 	CUDA_CHECK_RETURN(cudaMemcpy(d_property_violation, &zero, sizeof(inttype), cudaMemcpyHostToDevice))
 	inttype property_violation = 0;
+	inttype itercount = 0;
 	while (contBFS == 1) {
 		CUDA_CHECK_RETURN(cudaMemcpy(d_contBFS, &zero, sizeof(inttype), cudaMemcpyHostToDevice))
 		gather<<<nblocks, nthreadsperblock, shared_q_size*sizeof(inttype)>>>(d_q, d_h, d_bits_state, d_firstbit_statevector, d_proc_offsets_start,
@@ -1476,6 +1618,11 @@ int main(int argc, char** argv) {
 		//if (j == 1) {
 		scan = 1;
 		//}
+		// TODO: remove
+//		itercount++;
+//		if (itercount == 20) {
+//			break;
+//		}
 	}
 	// determine runtime
 	stop = clock();
@@ -1491,13 +1638,16 @@ int main(int argc, char** argv) {
 		}
 	}
 	// report error if required
-	//if (contBFS == 2) {
-	//	fprintf (stderr, "ERROR: problem with hash table\n");
-	//}
+	if (contBFS == 2) {
+		fprintf (stderr, "ERROR: problem with hash table\n");
+	}
 	//else {
 	// TODO: uncomment
 	// count_queue(d_q, q_size, firstbit_statevector, nr_procs, sv_nints);
 	//}
+
+//	cudaMemcpy(q_test, d_q, q_size*sizeof(inttype), cudaMemcpyDeviceToHost);
+//	print_local_queue(q_test, q_size, firstbit_statevector, nr_procs, sv_nints);
 
 	CUDA_CHECK_RETURN(cudaThreadSynchronize());	// Wait for the GPU launched work to complete
 	//CUDA_CHECK_RETURN(cudaGetLastError());
