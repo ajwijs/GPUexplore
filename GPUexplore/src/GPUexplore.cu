@@ -239,10 +239,12 @@ __device__ inttype STOREINCACHE(inttype* t, inttype* d_q, inttype bi, inttype bj
 			else {
 				for (bj = 0; bj < d_sv_nints-1; bj++) {
 					if (shared[CACHEOFFSET+bitmask+bj] != (t)[bj]) {
-						return 0;
+						break;
 					}
 				}
-				return d_shared_q_size;
+				if (bj == d_sv_nints-1) {
+					return d_shared_q_size;
+				}
 			}
 		}
 		if (!ISNEWINT(bi)) {
@@ -284,24 +286,16 @@ __device__ inttype STOREINCACHE(inttype* t, inttype* d_q, inttype bi, inttype bj
 
 #define COMPAREVECTORS(a, t1, t2)				{	(a) = 1; \
 													for (bk = 0; bk < d_sv_nints-1; bk++) { \
-														if (STRIPPEDSTATE((t1),bk) != STRIPPEDSTATE((t2),bk)) { \
+														if ((t1)[bk] != (t2)[bk]) { \
 															(a) = 0; break; \
 														} \
 													} \
+													if ((a)) { \
+														if (STRIPPEDSTATE((t1),bk) != STRIPPEDSTATE((t2),bk)) { \
+															(a) = 0; \
+														} \
+													} \
 												}
-
-//#define COMPAREVECTORS(a, t1, t2)				{	(a) = 1; \
-//													for (bk = 0; bk < d_sv_nints-1; bk++) { \
-//														if ((t1)[bk] != (t2)[bk]) { \
-//															(a) = 0; break; \
-//														} \
-//													} \
-//													if ((a)) { \
-//														if (STRIPPEDSTATE((t1),bk) != STRIPPEDSTATE((t2),bk)) { \
-//															(a) = 0; \
-//														} \
-//													} \
-//												}
 
 // check if bucket element associated with lane is a valid position to store data
 #define LANEPOINTSTOVALIDBUCKETPOS						(HALFLANE < ((HALFWARPSIZE / d_sv_nints)*d_sv_nints))
@@ -588,7 +582,7 @@ int cudaMallocCount ( void ** ptr,int size) {
 }
 
 //test function to print a given state vector
-void print_statevector(inttype *state, inttype *firstbit_statevector, inttype nr_procs, inttype sv_nints) {
+void print_statevector(FILE* stream, inttype *state, inttype *firstbit_statevector, inttype nr_procs, inttype sv_nints) {
 	inttype i, s, bitmask, bi;
 
 	for (i = 0; i < nr_procs; i++) {
@@ -602,16 +596,16 @@ void print_statevector(inttype *state, inttype *firstbit_statevector, inttype nr
 			s = (state[firstbit_statevector[i]/INTSIZE] >> (firstbit_statevector[i] % INTSIZE)
 					| (state[firstbit_statevector[i+1]/INTSIZE] & bitmask) << (INTSIZE - (firstbit_statevector[i] % INTSIZE))); \
 		}
-		fprintf (stdout, "%d", s);
+		fprintf (stream, "%d", s);
 		if (i < (nr_procs-1)) {
-			fprintf (stdout, ",");
+			fprintf (stream, ",");
 		}
 	}
 	fprintf (stdout, " ");
 	for (i = 0; i < sv_nints; i++) {
-		fprintf (stdout, "%d ", STRIPPEDENTRY_HOST(state[i], i));
+		fprintf (stream, "%d ", STRIPPEDENTRY_HOST(state[i], i));
 	}
-	fprintf (stdout, "\n");
+	fprintf (stream, "\n");
 }
 
 //test function to print the contents of the device queue
@@ -630,7 +624,7 @@ void print_queue(inttype *d_q, inttype q_size, inttype *firstbit_statevector, in
 					newcount++;
 					fprintf (stdout, "new: ");
 				}
-				print_statevector(&(q_test[(i*WARPSIZE)+STARTPOS_OF_EL_IN_BUCKET_HOST(j)]), firstbit_statevector, nr_procs, sv_nints);
+				print_statevector(stdout, &(q_test[(i*WARPSIZE)+STARTPOS_OF_EL_IN_BUCKET_HOST(j)]), firstbit_statevector, nr_procs, sv_nints);
 			}
 		}
 	}
@@ -638,7 +632,7 @@ void print_queue(inttype *d_q, inttype q_size, inttype *firstbit_statevector, in
 }
 
 //test function to print the contents of the device queue
-void print_local_queue(inttype *q, inttype q_size, inttype *firstbit_statevector, inttype nr_procs, inttype sv_nints) {
+void print_local_queue(FILE* stream, inttype *q, inttype q_size, inttype *firstbit_statevector, inttype nr_procs, inttype sv_nints) {
 	int count = 0, newcount = 0;
 	inttype nw;
 	for (inttype i = 0; i < (q_size/WARPSIZE); i++) {
@@ -646,16 +640,16 @@ void print_local_queue(inttype *q, inttype q_size, inttype *firstbit_statevector
 			if (q[(i*WARPSIZE)+STARTPOS_OF_EL_IN_BUCKET_HOST(j)+(sv_nints-1)] != EMPTYVECT32) {
 				count++;
 
-				if (j == 0) {
-					fprintf (stdout, "-----------\n");
-				}
+//				if (j == 0) {
+//					fprintf (stdout, "-----------\n");
+//				}
 				nw = ISNEWSTATE_HOST(&q[(i*WARPSIZE)+STARTPOS_OF_EL_IN_BUCKET_HOST(j)]);
 				if (nw) {
 					newcount++;
-					fprintf (stdout, "new: ");
+					fprintf (stream, "new: ");
 					//print_statevector(&(q[(i*WARPSIZE)+(j*sv_nints)]), firstbit_statevector, nr_procs);
 				}
-				print_statevector(&(q[(i*WARPSIZE)+STARTPOS_OF_EL_IN_BUCKET_HOST(j)]), firstbit_statevector, nr_procs, sv_nints);
+				print_statevector(stream, &(q[(i*WARPSIZE)+STARTPOS_OF_EL_IN_BUCKET_HOST(j)]), firstbit_statevector, nr_procs, sv_nints);
 			}
 		}
 	}
@@ -761,6 +755,8 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 	inttype bitmask, bi, bj, bk, bl;
 	indextype hashtmp;
 	int pos;
+	// TODO: remove this
+	inttype TMPVAR;
 	// is at least one outgoing transition enabled for a given state (needed to detect deadlocks)
 	inttype outtrans_enabled;
 
@@ -859,6 +855,8 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 				i = tex1Dfetch(tex_proc_offsets_start, GROUP_ID);
 				// Determine process state
 				GETSTATEVECTORSTATE(cont, src_state, GROUP_ID);
+				// TODO: remove
+				TMPVAR = cont;
 				// Offset position
 				index = cont/(INTSIZE/d_nbits_offset);
 				pos = cont - (index*(INTSIZE/d_nbits_offset));
@@ -888,6 +886,9 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		//int loopcounter = 0;
 		outtrans_enabled = 0;
 		while (CONTINUE == 1) {
+//			if (src_state[0] == 33026) { // label 31!
+//				PRINTTHREAD(0,0);
+//			}
 		// for (loopcounter = 0; loopcounter < 10000 && CONTINUE == 1; loopcounter++) {
 			if (offset1 < offset2 || cont) {
 				if (!cont) {
@@ -954,6 +955,9 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 					i = 0;
 					if (offset1 < offset2) {
 						GETPROCTRANSACT(act, tmp);
+//						if (src_state[0] == 33026 && act == 31) { // label 31!
+//							PRINTTHREAD(GROUP_ID,TMPVAR);
+//						}
 						//PRINTTHREAD(0, act);
 						// store transition entry
 						THREADBUFFERGROUPPOS(GROUP_ID,i) = tmp;
@@ -1083,6 +1087,9 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 											//PRINTTHREAD(1, THREADBUFFERGROUPPOS(pos,0));
 											//PRINTTHREAD(2, k);
 											SETSTATEVECTORSTATE(tgt_state, pos, k-1);
+//											if (src_state[0] == 33026 && act == 31) { // label 31!
+//												PRINTTHREAD(pos,k-1);
+//											}
 										}
 									}
 									//PRINTVECTOR(tgt_state);
@@ -1115,12 +1122,17 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 										//	}
 										//}
 										// cache time-out; store directly in global hash table
-										if (STOREINCACHE(tgt_state, d_q, bi, bj, bk, bl, bitmask, hashtmp) > d_shared_q_size) {
+										TMPVAR = STOREINCACHE(tgt_state, d_q, bi, bj, bk, bl, bitmask, hashtmp);
+										if (TMPVAR > d_shared_q_size) {
 											if (FINDORPUT_SINGLE(tgt_state, d_q, bi, bj, bk, bl, hashtmp) == 0) {
 												// ERROR! hash table too full. Set CONTINUE to 2
 												CONTINUE = 2;
 											}
 										}
+//										if (tgt_state[0] == 196866) { // src_state[0] == 33026, label 31! 196866
+//											PRINTTHREAD(555,TMPVAR);
+//											PRINTTHREAD(777,shared[CACHEOFFSET+TMPVAR]);
+//										}
 										// get next successor
 										for (pos = d_nr_procs-1; pos > (int) GROUP_ID-1; pos--) {
 											if (GETBIT(pos,tmp)) {
@@ -1237,6 +1249,9 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		// start scanning the local cache and write results to the global hash table
 		k = (d_shared_q_size-CACHEOFFSET)/d_sv_nints;
 		for (i = WARP_ID; i < k; i += (blockDim.x/WARPSIZE)) {
+//			if (shared[CACHEOFFSET+(i*d_sv_nints)] == 196866) { // src_state[0] == 33026, label 31!
+//				PRINTTHREAD(5,5);
+//			}
 			if (ISNEWSTATE(&shared[CACHEOFFSET+(i*d_sv_nints)])) {
 				// look for the state in the global hash table
 				if (FINDORPUT_WARP((inttype*) &shared[CACHEOFFSET+(i*d_sv_nints)], d_q, bi, bj, bk, bl, bitmask, hashtmp) == 0) {
@@ -1611,7 +1626,7 @@ int main(int argc, char** argv) {
 			}
 			else if (verbosity == 3) {
 				cudaMemcpy(q_test, d_q, q_size*sizeof(inttype), cudaMemcpyDeviceToHost);
-				print_local_queue(q_test, q_size, firstbit_statevector, nr_procs, sv_nints);
+				print_local_queue(stdout, q_test, q_size, firstbit_statevector, nr_procs, sv_nints);
 			}
 		}
 		//j++;
@@ -1646,8 +1661,11 @@ int main(int argc, char** argv) {
 	// count_queue(d_q, q_size, firstbit_statevector, nr_procs, sv_nints);
 	//}
 
-//	cudaMemcpy(q_test, d_q, q_size*sizeof(inttype), cudaMemcpyDeviceToHost);
-//	print_local_queue(q_test, q_size, firstbit_statevector, nr_procs, sv_nints);
+	FILE* fout;
+	fout = fopen("/home/awijs/output", "w");
+	cudaMemcpy(q_test, d_q, q_size*sizeof(inttype), cudaMemcpyDeviceToHost);
+	print_local_queue(fout, q_test, q_size, firstbit_statevector, nr_procs, sv_nints);
+	fclose(fout);
 
 	CUDA_CHECK_RETURN(cudaThreadSynchronize());	// Wait for the GPU launched work to complete
 	//CUDA_CHECK_RETURN(cudaGetLastError());
