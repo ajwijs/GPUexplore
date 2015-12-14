@@ -20,14 +20,21 @@
 
 // type of elements used
 #define inttype uint32_t
+// type of indices in hash table
+#define indextype uint64_t
 
-__forceinline__ inttype MIN(inttype a, inttype b) {
-	return (a < b) ? a : b;
-}
+enum BucketEntryStatus { EMPTY, TAKEN, FOUND };
+enum PropertyStatus { NONE, DEADLOCK, SAFETY, LIVENESS };
 
-__forceinline__ inttype MAX(inttype a, inttype b) {
-   return (a > b) ? a : b;
-}
+#define MIN(a,b) \
+   ({ __typeof__ (a) _a = (a); \
+       __typeof__ (b) _b = (b); \
+     _a < _b ? _a : _b; })
+
+#define MAX(a,b) \
+   ({ __typeof__ (a) _a = (a); \
+       __typeof__ (b) _b = (b); \
+     _a > _b ? _a : _b; })
 
 // Nr of tiles processed in single kernel launch
 //#define TILEITERS 10
@@ -35,7 +42,37 @@ __forceinline__ inttype MAX(inttype a, inttype b) {
 static const int WARPSIZE = 32;
 static const int HALFWARPSIZE = 16;
 static const int INTSIZE = 32;
-static const int BUFFERSIZE = 32;
+static const int BUFFERSIZE = 50;
+
+// GPU constants
+__constant__ inttype d_nrbuckets;
+__constant__ inttype d_shared_q_size;
+__constant__ inttype d_nr_procs;
+__constant__ inttype d_max_buf_ints;
+__constant__ inttype d_sv_nints;
+__constant__ inttype d_bits_act;
+__constant__ inttype d_nbits_offset;
+__constant__ inttype d_kernel_iters;
+__constant__ inttype d_nbits_syncbits_offset;
+__constant__ PropertyStatus d_property;
+
+// GPU shared memory array
+extern volatile __shared__ inttype shared[];
+
+// thread ids
+#define WARP_ID							(threadIdx.x / WARPSIZE)
+#define GLOBAL_WARP_ID					(((blockDim.x / WARPSIZE)*blockIdx.x)+WARP_ID)
+#define NR_WARPS						((blockDim.x / WARPSIZE)*gridDim.x)
+#define LANE							(threadIdx.x % WARPSIZE)
+#define HALFLANE						(threadIdx.x % HALFWARPSIZE)
+//#define ENTRY_ID						(LANE % d_sv_nints)
+#define ENTRY_ID						(HALFLANE % d_sv_nints)
+#define GROUP_ID						(threadIdx.x % d_nr_procs)
+
+//#define NREL_IN_BUCKET					((WARPSIZE / d_sv_nints))
+#define NREL_IN_BUCKET					((HALFWARPSIZE / d_sv_nints)*2)
+#define NREL_IN_BUCKET_HOST				((HALFWARPSIZE / sv_nints)*2)
+
 // constant for cuckoo hashing (Alcantara et al)
 static const inttype P = 334214459;
 // Retry constant to determine number of retries for element insertion
@@ -51,8 +88,11 @@ static const inttype EMPTYVECT32 = 0x7FFFFFFF;
 # define EXPLORATION_DONE 0x7FFFFFFF
 // offset in shared memory from which loaded data can be read
 static const int SH_OFFSET = 3;
+//static const int KERNEL_ITERS = 10;
+//static const int NR_OF_BLOCKS = 3120;
+//static const int BLOCK_SIZE = 512;
 static const int KERNEL_ITERS = 10;
-static const int NR_OF_BLOCKS = 3120;
+static const int NR_OF_BLOCKS = 2;
 static const int BLOCK_SIZE = 512;
 const size_t Mb = 1<<20;
 
@@ -75,7 +115,7 @@ const size_t Mb = 1<<20;
 #define CACHEOFFSET 					(SH_OFFSET+HASHCONSTANTSLEN+VECTORPOSLEN+LTSSTATESIZELEN+OPENTILELEN+THREADBUFFERLEN)
 
 // parameter is thread id
-#define THREADBUFFERGROUPSTART(i)		THREADBUFFEROFFSET+(((i) / d_nr_procs)*(1+(d_nr_procs*d_max_buf_ints)))
+#define THREADBUFFERGROUPSTART(i)		(THREADBUFFEROFFSET+(((i) / d_nr_procs)*(1+(d_nr_procs*d_max_buf_ints))))
 // parameter is group id
 #define THREADBUFFERGROUPPOS(i, j)		shared[THREADBUFFERGROUPSTART(threadIdx.x)+1+((i)*d_max_buf_ints)+(j)]
 #define THREADGROUPCOUNTER				shared[(THREADBUFFERGROUPSTART(threadIdx.x))]
@@ -91,50 +131,11 @@ const size_t Mb = 1<<20;
 #define CONTINUE						(shared[1])
 #define OPENTILECOUNT					(shared[2])
 
-// thread ids
-#define WARP_ID							(threadIdx.x / WARPSIZE)
-#define GLOBAL_WARP_ID					(((blockDim.x / WARPSIZE)*blockIdx.x)+WARP_ID)
-#define NR_WARPS						((blockDim.x / WARPSIZE)*gridDim.x)
-#define LANE							(threadIdx.x % WARPSIZE)
-#define HALFLANE						(threadIdx.x % HALFWARPSIZE)
-#define ENTRY_ID						(HALFLANE % d_sv_nints)
-#define GROUP_ID						(threadIdx.x % d_nr_procs)
-
-#define NREL_IN_BUCKET					((HALFWARPSIZE / d_sv_nints)*2)
-
-
-
-// GPU constants
-__constant__ inttype d_nrbuckets;
-__constant__ inttype d_shared_q_size;
-__constant__ inttype d_nr_procs;
-__constant__ inttype d_max_buf_ints;
-__constant__ inttype d_sv_nints;
-__constant__ inttype d_bits_act;
-__constant__ inttype d_nbits_offset;
-__constant__ inttype d_kernel_iters;
-__constant__ inttype d_nbits_syncbits_offset;
-__constant__ inttype d_property;
-
-// GPU shared memory structure
-extern volatile __shared__ inttype shared[];
-
-
-__device__ inttype LANE_POINTS_TO_EL(inttype i)	{
-	if (i < HALFWARPSIZE / d_sv_nints) {
-		return (LANE >= i*d_sv_nints && LANE < (i+1)*d_sv_nints);
-	}
-	else {
-		return (LANE >= HALFWARPSIZE+(i-(HALFWARPSIZE / d_sv_nints))*d_sv_nints && LANE < HALFWARPSIZE+(i-(HALFWARPSIZE / d_sv_nints)+1)*d_sv_nints);
-	}
-}
-
 // BIT MANIPULATION MACROS
 
 #define SETBIT(i, x)							{(x) = ((((inttype) 1)<<(i)) | (x));}
 #define GETBIT(i, x)							(((x) >> (i)) & ((inttype) 1))
 #define SETBITS(i, j, x)						for (bi = (i); bi < (j); bi++) { (x) = (x) | (((inttype) 1)<<bi); }
-
 #define GETPROCTRANSACT(a, t)					{bitmask = 0; SETBITS(1, 1+d_bits_act, bitmask); (a) = ((t) & bitmask) >> 1;}
 #define GETPROCTRANSSYNC(a, t)					{(a) = ((t) & 1);}
 #define GETPROCTRANSSTATE(a, t, i, j)			{bitmask = 0; SETBITS(1+d_bits_act+((i)-1)*shared[LTSSTATESIZEOFFSET+(j)], \
@@ -186,15 +187,10 @@ __device__ inttype LANE_POINTS_TO_EL(inttype i)	{
 #define ISNEWINT(t)								((t) >> 31)
 #define OLDINT(t)								((t) & 0x7FFFFFFF)
 #define NEWINT(t)								((t) | 0x80000000)
-// TODO: change!
-// TODO: change to 30!
-#define ISOLDCACHEINT(t)						(((t) >> 31 == 0) ? 1 : 0)
-//#define SETOLDCACHESTATE(t)						{	(t)[(d_sv_nints-1)] = (t)[(d_sv_nints)-1] & 0x3FFFFFFF;}
-// TODO: change to 3FFFFFFF!
-#define SETOLDCACHEINT(t)						{	(t) = (t) | 0x7FFFFFFF;}
-
 #define STRIPSTATE(t)							{(t)[(d_sv_nints-1)] = (t)[(d_sv_nints-1)] & 0x7FFFFFFF;}
 #define STRIPPEDSTATE(t, i)						((i == d_sv_nints-1) ? ((t)[i] & 0x7FFFFFFF) : (t)[i])
+#define STRIPPEDENTRY(t, i)						((i == d_sv_nints-1) ? ((t) & 0x7FFFFFFF) : (t))
+#define STRIPPEDENTRY_HOST(t, i)				((i == sv_nints-1) ? ((t) & 0x7FFFFFFF) : (t))
 #define NEWSTATEPART(t, i)						(((i) == d_sv_nints-1) ? ((t)[d_sv_nints-1] | 0x80000000) : (t)[(i)])
 #define COMPAREENTRIES(t1, t2)					(((t1) & 0x7FFFFFFF) == ((t2) & 0x7FFFFFFF))
 #define OWNSSYNCRULE(a, t, i)					{if (GETBIT((i),(t))) { \
@@ -216,39 +212,46 @@ __device__ inttype LANE_POINTS_TO_EL(inttype i)	{
 													} \
 												} \
 												}
-// check if bucket element associated with lane is a valid position to store data
-#define LANEPOINTSTOVALIDBUCKETPOS						((LANE % HALFWARPSIZE) < ((HALFWARPSIZE / d_sv_nints)*d_sv_nints))
 
 // HASH TABLE MACROS
 
 // Return d_shared_q_size if duplicate found, d_shared_q_size+1 if cache is full
-__device__ inttype STOREINCACHE(inttype* t, inttype bi, inttype bj, inttype bk, inttype bl, inttype bitmask, inttype hashtmp) {
+__device__ inttype STOREINCACHE(inttype* t, inttype* d_q, inttype bi, inttype bj, inttype bk, inttype bl, inttype bitmask, indextype hashtmp) {
+	STRIPSTATE(t);
 	hashtmp = 0;
 	for (bi = 0; bi < d_sv_nints; bi++) {
-		hashtmp += STRIPPEDSTATE(t, bi);
+		hashtmp += t[bi];
 	}
 	bitmask = d_sv_nints*((inttype) (hashtmp % ((d_shared_q_size - CACHEOFFSET) / d_sv_nints)));
+	SETNEWSTATE(t);
 	bl = 0;
 	while (bl < CACHERETRYFREQ) {
-		bi = atomicCAS((inttype *) &shared[CACHEOFFSET+bitmask], EMPTYVECT32, t[0]); \
+		bi = atomicCAS((inttype *) &shared[CACHEOFFSET+bitmask+(d_sv_nints-1)], EMPTYVECT32, t[d_sv_nints-1]);
 		if (bi == EMPTYVECT32) {
-			for (bj = 1; bj < d_sv_nints; bj++) {
+			for (bj = 0; bj < d_sv_nints-1; bj++) {
 				shared[CACHEOFFSET+bitmask+bj] = t[bj];
 			}
 			return bitmask;
 		}
-		if (COMPAREENTRIES(bi, t[0])) {
-			for (bj = 1; bj < d_sv_nints; bj++) { \
-				if (STRIPPEDSTATE(&(shared[CACHEOFFSET+bitmask]), bj) != STRIPPEDSTATE(t, bj)) {
-					return 0;
+		if (COMPAREENTRIES(bi, t[d_sv_nints-1])) {
+			if (d_sv_nints == 1) {
+				return d_shared_q_size;
+			}
+			else {
+				for (bj = 0; bj < d_sv_nints-1; bj++) {
+					if (shared[CACHEOFFSET+bitmask+bj] != (t)[bj]) {
+						break;
+					}
+				}
+				if (bj == d_sv_nints-1) {
+					return d_shared_q_size;
 				}
 			}
-			return d_shared_q_size;
 		}
 		if (!ISNEWINT(bi)) {
-			bj = atomicCAS((inttype *) &shared[CACHEOFFSET+bitmask], bi, t[0]);
+			bj = atomicCAS((inttype *) &shared[CACHEOFFSET+bitmask+(d_sv_nints-1)], bi, t[d_sv_nints-1]);
 			if (bi == bj) {
-				for (bk = 1; bk < d_sv_nints; bk++) {
+				for (bk = 0; bk < d_sv_nints-1; bk++) {
 					shared[CACHEOFFSET+bitmask+bk] = t[bk];
 				}
 				return bitmask;
@@ -266,56 +269,86 @@ __device__ inttype STOREINCACHE(inttype* t, inttype bi, inttype bj, inttype bk, 
 // hash functions use bj variable
 #define FIRSTHASH(a, t)							{	hashtmp = 0; \
 													for (bj = 0; bj < d_sv_nints; bj++) { \
-														hashtmp += (uint64_t) (d_h[0]*(STRIPPEDSTATE((t), bj))+d_h[1]); \
+														hashtmp += (indextype) (d_h[0]*(STRIPPEDSTATE(t, bj))+d_h[1]); \
 													} \
 													(a) = WARPSIZE*((inttype) ((hashtmp % P) % d_nrbuckets)); \
 												}
-#define FIRSTHASHHOST(a)						{	uint64_t hashtmp = 0; \
-													hashtmp = (uint64_t) h[1]; \
+#define FIRSTHASHHOST(a)						{	indextype hashtmp = 0; \
+													hashtmp = (indextype) h[1]; \
 													(a) = WARPSIZE*((inttype) ((hashtmp % P) % q_size/WARPSIZE)); \
 												}
 #define HASHALL(a, i, t)						{	hashtmp = 0; \
 													for (bj = 0; bj < d_sv_nints; bj++) { \
-														hashtmp += (uint64_t) (shared[HASHCONSTANTSOFFSET+(2*(i))]*(STRIPPEDSTATE((t), bj))+shared[HASHCONSTANTSOFFSET+(2*(i))+1]); \
+														hashtmp += (indextype) (shared[HASHCONSTANTSOFFSET+(2*(i))]*(STRIPPEDSTATE(t, bj))+shared[HASHCONSTANTSOFFSET+(2*(i))+1]); \
 													} \
 													(a) = WARPSIZE*((inttype) ((hashtmp % P) % d_nrbuckets)); \
 												}
 #define HASHFUNCTION(a, i, t)					((HASHALL((a), (i), (t))))
 
-__device__ inttype COMPAREVECTORS(inttype* t1, inttype* t2, inttype bk) {
-	for (bk = 0; bk < d_sv_nints; bk++) {
-		if (STRIPPEDSTATE(t1, bk) != STRIPPEDSTATE(t2, bk)) {
-			return 0;
-		}
+#define COMPAREVECTORS(a, t1, t2)				{	(a) = 1; \
+													for (bk = 0; bk < d_sv_nints-1; bk++) { \
+														if ((t1)[bk] != (t2)[bk]) { \
+															(a) = 0; break; \
+														} \
+													} \
+													if ((a)) { \
+														if (STRIPPEDSTATE((t1),bk) != STRIPPEDSTATE((t2),bk)) { \
+															(a) = 0; \
+														} \
+													} \
+												}
+
+// check if bucket element associated with lane is a valid position to store data
+#define LANEPOINTSTOVALIDBUCKETPOS						(HALFLANE < ((HALFWARPSIZE / d_sv_nints)*d_sv_nints))
+//#define LANEPOINTSTOVALIDBUCKETPOS						true
+
+__device__ inttype LANE_POINTS_TO_EL(inttype i)	{
+	if (i < HALFWARPSIZE / d_sv_nints) {
+		return (LANE >= i*d_sv_nints && LANE < (i+1)*d_sv_nints);
 	}
-	return 1;
+	else {
+		return (LANE >= HALFWARPSIZE+(i-(HALFWARPSIZE / d_sv_nints))*d_sv_nints && LANE < HALFWARPSIZE+(i-(HALFWARPSIZE / d_sv_nints)+1)*d_sv_nints);
+	}
 }
 
+//__device__ inttype LANE_POINTS_TO_EL(inttype i)	{
+//	return (LANE >= i*d_sv_nints && LANE < (i+1)*d_sv_nints);
+//}
+
+// start position of element i in bucket
+#define STARTPOS_OF_EL_IN_BUCKET(i)			((i < (HALFWARPSIZE / d_sv_nints)) ? (i*d_sv_nints) : (HALFWARPSIZE + (i-(HALFWARPSIZE/d_sv_nints))*d_sv_nints))
+//#define STARTPOS_OF_EL_IN_BUCKET(i)			(i*d_sv_nints)
+#define STARTPOS_OF_EL_IN_BUCKET_HOST(i)	((i < (HALFWARPSIZE / sv_nints)) ? (i*sv_nints) : (HALFWARPSIZE + (i-(HALFWARPSIZE/sv_nints))*sv_nints))
+//#define STARTPOS_OF_EL_IN_BUCKET_HOST(i)	(i*sv_nints)
+
 // find or put element, single thread version.
-__device__ inttype FINDORPUT_SINGLE(inttype* t, inttype* d_q, inttype bi, inttype bj, inttype bk, inttype bl, inttype bitmask, inttype hashtmp) {
+__device__ inttype FINDORPUT_SINGLE(inttype* t, inttype* d_q, inttype bi, inttype bj, inttype bk, inttype bl, indextype hashtmp) {
 	for (bi = 0; bi < NR_HASH_FUNCTIONS; bi++) {
-		HASHFUNCTION(bitmask, bi, t);
+		HASHFUNCTION(hashtmp, bi, t);
 		for (bj = 0; bj < NREL_IN_BUCKET; bj++) {
-			bl = d_q[bitmask+(bj*d_sv_nints)];
+			bl = d_q[hashtmp+STARTPOS_OF_EL_IN_BUCKET(bj)+(d_sv_nints-1)];
 			if (bl == EMPTYVECT32) {
-				bl = atomicCAS(&d_q[bitmask+(bj*d_sv_nints)], EMPTYVECT32, t[0]);
+				bl = atomicCAS(&d_q[hashtmp+STARTPOS_OF_EL_IN_BUCKET(bj)+(d_sv_nints-1)], EMPTYVECT32, t[d_sv_nints-1]);
 				if (bl == EMPTYVECT32) {
-					for (bk = 1; bk < d_sv_nints; bk++) {
-						d_q[bitmask+(bj*d_sv_nints)+bk] = t[bk];
+					if (d_sv_nints > 1) {
+						for (bk = 0; bk < d_sv_nints-1; bk++) {
+							d_q[hashtmp+STARTPOS_OF_EL_IN_BUCKET(bj)+bk] = t[bk];
+						}
 					}
 				}
 			}
 			if (bl != EMPTYVECT32) {
-				if (COMPAREVECTORS(&d_q[bitmask+(bj*d_sv_nints)], t, bk) == 1) {
-					break;
+				COMPAREVECTORS(bk, &d_q[hashtmp+STARTPOS_OF_EL_IN_BUCKET(bj)], t); \
+				if (bk == 1) {
+					return 1;
 				}
 			}
 			else {
 				SETOLDSTATE(t);
 				if (ITERATIONS < d_kernel_iters-1) {
 					bk = atomicAdd((inttype *) &OPENTILECOUNT, d_sv_nints);
-					if (bk < d_sv_nints*(blockDim.x / d_nr_procs)) {
-						d_q[bitmask+(bj*d_sv_nints)+(d_sv_nints-1)] = t[d_sv_nints-1];
+					if (bk < OPENTILELEN) {
+						d_q[hashtmp+STARTPOS_OF_EL_IN_BUCKET(bj)+(d_sv_nints-1)] = t[d_sv_nints-1];
 						for (bl = 0; bl < d_sv_nints; bl++) {
 							shared[OPENTILEOFFSET+bk+bl] = NEWSTATEPART(t, bl);
 						}
@@ -329,54 +362,162 @@ __device__ inttype FINDORPUT_SINGLE(inttype* t, inttype* d_q, inttype bi, inttyp
 }
 
 // find or put element, warp version. t is element stored in block cache
-#define FINDORPUT_WARP(a, t)				{	(a) = 0; \
-												for (bi = 0; bi < NR_HASH_FUNCTIONS; bi++) { \
-													HASHFUNCTION(bitmask, bi, (t)); \
-													bl = d_q[bitmask+LANE]; \
-													bk = __ballot(STRIPPEDSTATE(&bl, 0) == STRIPPEDSTATE((t), ENTRY_ID)); \
-													if (LANEPOINTSTOVALIDBUCKETPOS) { \
-														(a) = 0; \
-														SETBITS(LANE-ENTRY_ID, LANE-ENTRY_ID+d_sv_nints-1, (a)); \
-														if (bk & (a) == (a)) { \
-															if (ENTRY_ID == d_sv_nints-1) { \
-																SETOLDCACHEINT((t)[ENTRY_ID]); \
-															} \
-														} \
-													} \
-													(a) = 0; \
-													if (!ISOLDCACHEINT((t)[d_sv_nints-1])) { \
-														for (bj = 0; bj < NREL_IN_BUCKET; bj++) { \
-															if (LANE_POINTS_TO_EL(bj)) { \
-																bk = atomicCAS(&d_q[bitmask+LANE], EMPTYVECT32, (t)[ENTRY_ID]); \
-																if (bk == EMPTYVECT32) { \
-																	if (ENTRY_ID == 0) { \
-																		SETOLDCACHEINT((t)[d_sv_nints-1]); \
-																	} \
-																	if (ITERATIONS < d_kernel_iters-1) { \
-																		if (ENTRY_ID == 0) { \
-																			bk = atomicAdd((inttype *) &OPENTILECOUNT, d_sv_nints); \
-																			if (bk < OPENTILELEN) { \
-																				d_q[bitmask+LANE+(d_sv_nints-1)] = (t)[d_sv_nints-1]; \
-																			} \
-																		} \
-																		bk = __shfl(bk, LANE-ENTRY_ID); \
-																		if (bk < OPENTILELEN) { \
-																			shared[OPENTILEOFFSET+bk+ENTRY_ID] = NEWSTATEPART((t), ENTRY_ID); \
-																		} \
-																	} \
-																} \
-															} \
-															if (ISOLDCACHEINT((t)[d_sv_nints-1])) { \
-																break; \
-															} \
-														} \
-													} \
-													if (ISOLDCACHEINT((t)[d_sv_nints-1])) { \
-														(a) = 1; \
-														break; \
-													} \
-												} \
-											}
+__device__ inttype FINDORPUT_WARP(inttype* t, inttype* d_q, inttype bi, inttype bj, inttype bk, inttype bl, inttype bitmask, indextype hashtmp)	{
+	BucketEntryStatus threadstatus;
+	// prepare bitmask once to reason about results of threads in the same (state vector) group
+	bitmask = 0;
+	if (LANEPOINTSTOVALIDBUCKETPOS) {
+		SETBITS(LANE-ENTRY_ID, LANE-ENTRY_ID+d_sv_nints, bitmask);
+	}
+	for (bi = 0; bi < NR_HASH_FUNCTIONS; bi++) {
+		HASHFUNCTION(hashtmp, bi, t);
+		bl = d_q[hashtmp+LANE];
+//		if (t[0] == 167790159) {
+//			PRINTTHREAD(bi, STRIPPEDENTRY(bl, ENTRY_ID));
+//		}
+		bk = __ballot(STRIPPEDENTRY(bl, ENTRY_ID) == STRIPPEDSTATE(t, ENTRY_ID));
+		// threadstatus is used to determine whether full state vector has been found
+		threadstatus = EMPTY;
+//		if (t[0] == 167790159) {
+//			// print outcome
+//			PRINTTHREAD(33, bk);
+//		}
+		if (LANEPOINTSTOVALIDBUCKETPOS) {
+//			if (t[0] == 167790159) {
+//				PRINTTHREAD(bk & bitmask,bitmask);
+//			}
+			if ((bk & bitmask) == bitmask) {
+				//if (t[0] == 167790159) {
+				//	PRINTTHREAD(999,0);
+				//}
+				threadstatus = FOUND;
+			}
+		}
+		if (__ballot(threadstatus == FOUND) != 0) {
+			// state vector has been found in bucket. mark local copy as old.
+			//PRINTTHREAD(55, 0);
+			if (LANE == 0) {
+				SETOLDSTATE(t);
+			}
+			return 1;
+		}
+		// try to find empty position to insert new state vector
+		threadstatus = (bl == EMPTYVECT32 && LANEPOINTSTOVALIDBUCKETPOS) ? EMPTY : TAKEN;
+		// let bk hold the smallest index of an available empty position
+		bk = __ffs(__ballot(threadstatus == EMPTY));
+		while (bk != 0) {
+			// write the state vector
+			bk--;
+			if (LANE >= bk && LANE < bk+d_sv_nints) {
+				bl = atomicCAS(&(d_q[hashtmp+LANE]), EMPTYVECT32, t[ENTRY_ID]);
+				if (bl == EMPTYVECT32) {
+					// success
+					if (ENTRY_ID == d_sv_nints-1) {
+						SETOLDSTATE(t);
+					}
+					if (ITERATIONS < d_kernel_iters-1) {
+						// try to claim the state vector for future work
+						bl = OPENTILELEN;
+						if (ENTRY_ID == d_sv_nints-1) {
+							// try to increment the OPENTILECOUNT counter
+							bl = atomicAdd((inttype *) &OPENTILECOUNT, d_sv_nints);
+							if (bl < OPENTILELEN) {
+								d_q[hashtmp+LANE] = t[d_sv_nints-1];
+							}
+						}
+						// all active threads read the OPENTILECOUNT value of the first thread, and possibly store their part of the vector in the shared memory
+						bl = __shfl(bl, LANE-ENTRY_ID+d_sv_nints-1);
+						if (bl < OPENTILELEN) {
+							// write part of vector to shared memory
+							shared[OPENTILEOFFSET+bl+ENTRY_ID] = NEWSTATEPART(t, ENTRY_ID);
+						}
+					}
+					// write was successful. propagate this to the whole warp by setting threadstatus to FOUND
+					threadstatus = FOUND;
+				}
+				else {
+					// write was not successful. check if the state vector now in place equals the one we are trying to insert
+					bk = __ballot(STRIPPEDENTRY(bl, ENTRY_ID) == STRIPPEDSTATE(t, ENTRY_ID));
+					if ((bk & bitmask) == bitmask) {
+						// state vector has been found in bucket. mark local copy as old.
+						if (LANE == bk) {
+							SETOLDSTATE(t);
+						}
+						// propagate this result to the whole warp
+						threadstatus = FOUND;
+					}
+					else {
+						// state vector is different, and position in bucket is taken
+						threadstatus = TAKEN;
+					}
+				}
+			}
+			// check if the state vector was either encountered or inserted
+			if (__ballot(threadstatus == FOUND) != 0) {
+				return 1;
+			}
+			// recompute bk
+			bk = __ffs(__ballot(threadstatus == EMPTY));
+		}
+	}
+	return 0;
+}
+
+__device__ inttype FINDORPUT_WARP_ORIG(inttype* t, inttype* d_q, inttype bi, inttype bj, inttype bk, inttype bl, inttype bitmask, indextype hashtmp) {
+	for (bi = 0; bi < NR_HASH_FUNCTIONS; bi++) {
+		HASHFUNCTION(hashtmp, bi, t);
+		bl = d_q[hashtmp+LANE];
+		if (ENTRY_ID == (d_sv_nints-1)) {
+			if (bl != EMPTYVECT32) {
+				COMPAREVECTORS(bl, &d_q[hashtmp+LANE-(d_sv_nints-1)], (t));
+				if (bl) {
+					SETOLDSTATE((t));
+				}
+			}
+		}
+		if (ISNEWSTATE(t)) {
+			for (bj = 0; bj < NREL_IN_BUCKET; bj++) {
+				if (d_q[hashtmp+STARTPOS_OF_EL_IN_BUCKET(bj)+(d_sv_nints-1)] == EMPTYVECT32) {
+					if (LANE == 0) {
+						bl = atomicCAS(&d_q[hashtmp+STARTPOS_OF_EL_IN_BUCKET(bj)+(d_sv_nints-1)], EMPTYVECT32, t[d_sv_nints-1]);
+						if (bl == EMPTYVECT32) {
+							SETOLDSTATE(t);
+							shared[THREADBUFFEROFFSET+WARP_ID] = OPENTILELEN;
+							if (ITERATIONS < d_kernel_iters-1) {
+								bk = atomicAdd((inttype *) &OPENTILECOUNT, d_sv_nints);
+								if (bk < OPENTILELEN) {
+									shared[THREADBUFFEROFFSET+WARP_ID] = bk;
+									d_q[hashtmp+STARTPOS_OF_EL_IN_BUCKET(bj)+(d_sv_nints-1)] = t[d_sv_nints-1];
+								}
+							}
+						}
+					}
+					if (!ISNEWSTATE(t)) {
+						if (LANE < d_sv_nints - 1) {
+							d_q[hashtmp+STARTPOS_OF_EL_IN_BUCKET(bj)+LANE] = t[LANE];
+						}
+						bk = shared[THREADBUFFEROFFSET+WARP_ID];
+						if (bk != OPENTILELEN) {
+							if (LANE < d_sv_nints) {
+								shared[OPENTILEOFFSET+bk+LANE] = NEWSTATEPART(t, LANE);
+							}
+							if (LANE == 0) {
+								shared[THREADBUFFEROFFSET+WARP_ID] = 0;
+							}
+						}
+					}
+				}
+				if (!ISNEWSTATE((t))) {
+					return 1;
+				}
+			}
+		}
+		if (!ISNEWSTATE((t))) {
+			return 1;
+		}
+	}
+	return 0;
+}
 
 // macro to print state vector
 //#define PRINTVECTOR(s) 							{	printf ("("); \
@@ -442,7 +583,7 @@ int cudaMallocCount ( void ** ptr,int size) {
 }
 
 //test function to print a given state vector
-void print_statevector(inttype *state, inttype *firstbit_statevector, inttype nr_procs) {
+void print_statevector(FILE* stream, inttype *state, inttype *firstbit_statevector, inttype nr_procs, inttype sv_nints) {
 	inttype i, s, bitmask, bi;
 
 	for (i = 0; i < nr_procs; i++) {
@@ -456,12 +597,16 @@ void print_statevector(inttype *state, inttype *firstbit_statevector, inttype nr
 			s = (state[firstbit_statevector[i]/INTSIZE] >> (firstbit_statevector[i] % INTSIZE)
 					| (state[firstbit_statevector[i+1]/INTSIZE] & bitmask) << (INTSIZE - (firstbit_statevector[i] % INTSIZE))); \
 		}
-		fprintf (stdout, "%d", s);
+		fprintf (stream, "%d", s);
 		if (i < (nr_procs-1)) {
-			fprintf (stdout, ",");
+			fprintf (stream, ",");
 		}
 	}
-	fprintf (stdout, "\n");
+	fprintf (stdout, " ");
+	for (i = 0; i < sv_nints; i++) {
+		fprintf (stream, "%d ", STRIPPEDENTRY_HOST(state[i], i));
+	}
+	fprintf (stream, "\n");
 }
 
 //test function to print the contents of the device queue
@@ -472,15 +617,15 @@ void print_queue(inttype *d_q, inttype q_size, inttype *firstbit_statevector, in
 	int count = 0;
 	int newcount = 0;
 	for (inttype i = 0; i < (q_size/WARPSIZE); i++) {
-		for (inttype j = 0; j < (WARPSIZE/sv_nints); j++) {
-			if (q_test[(i*WARPSIZE)+(j*sv_nints)+(sv_nints-1)] != EMPTYVECT32) {
+		for (inttype j = 0; j < NREL_IN_BUCKET_HOST; j++) {
+			if (q_test[(i*WARPSIZE)+STARTPOS_OF_EL_IN_BUCKET_HOST(j)+(sv_nints-1)] != EMPTYVECT32) {
 				count++;
-				nw = ISNEWSTATE_HOST(&q_test[(i*WARPSIZE)+(j*sv_nints)]);
+				nw = ISNEWSTATE_HOST(&q_test[(i*WARPSIZE)+STARTPOS_OF_EL_IN_BUCKET_HOST(j)]);
 				if (nw) {
 					newcount++;
 					fprintf (stdout, "new: ");
 				}
-				print_statevector(&(q_test[(i*WARPSIZE)+(j*sv_nints)]), firstbit_statevector, nr_procs);
+				print_statevector(stdout, &(q_test[(i*WARPSIZE)+STARTPOS_OF_EL_IN_BUCKET_HOST(j)]), firstbit_statevector, nr_procs, sv_nints);
 			}
 		}
 	}
@@ -488,20 +633,24 @@ void print_queue(inttype *d_q, inttype q_size, inttype *firstbit_statevector, in
 }
 
 //test function to print the contents of the device queue
-void print_local_queue(inttype *q, inttype q_size, inttype *firstbit_statevector, inttype nr_procs, inttype sv_nints) {
+void print_local_queue(FILE* stream, inttype *q, inttype q_size, inttype *firstbit_statevector, inttype nr_procs, inttype sv_nints) {
 	int count = 0, newcount = 0;
 	inttype nw;
 	for (inttype i = 0; i < (q_size/WARPSIZE); i++) {
-		for (inttype j = 0; j < (WARPSIZE/sv_nints); j++) {
-			if (q[(i*WARPSIZE)+(j*sv_nints)+(sv_nints-1)] != EMPTYVECT32) {
+		for (inttype j = 0; j < NREL_IN_BUCKET_HOST; j++) {
+			if (q[(i*WARPSIZE)+STARTPOS_OF_EL_IN_BUCKET_HOST(j)+(sv_nints-1)] != EMPTYVECT32) {
 				count++;
-				nw = ISNEWSTATE_HOST(&q[(i*WARPSIZE)+(j*sv_nints)]);
+
+//				if (j == 0) {
+//					fprintf (stdout, "-----------\n");
+//				}
+				nw = ISNEWSTATE_HOST(&q[(i*WARPSIZE)+STARTPOS_OF_EL_IN_BUCKET_HOST(j)]);
 				if (nw) {
 					newcount++;
-					fprintf (stdout, "new: ");
-					//print_statevector(&(q[(i*32)+(j*sv_nints)]), firstbit_statevector, nr_procs);
+					fprintf (stream, "new: ");
+					//print_statevector(&(q[(i*WARPSIZE)+(j*sv_nints)]), firstbit_statevector, nr_procs);
 				}
-				print_statevector(&(q[(i*WARPSIZE)+(j*sv_nints)]), firstbit_statevector, nr_procs);
+				print_statevector(stream, &(q[(i*WARPSIZE)+STARTPOS_OF_EL_IN_BUCKET_HOST(j)]), firstbit_statevector, nr_procs, sv_nints);
 			}
 		}
 	}
@@ -515,8 +664,8 @@ void count_queue(inttype *d_q, inttype q_size, inttype *firstbit_statevector, in
 
 	int count = 0;
 	for (inttype i = 0; i < (q_size/WARPSIZE); i++) {
-		for (inttype j = 0; j < (WARPSIZE/sv_nints); j++) {
-			if (q_test[(i*WARPSIZE)+(j*sv_nints)+(sv_nints-1)] != EMPTYVECT32) {
+		for (inttype j = 0; j < NREL_IN_BUCKET_HOST; j++) {
+			if (q_test[(i*WARPSIZE)+STARTPOS_OF_EL_IN_BUCKET_HOST(j)+(sv_nints-1)] != EMPTYVECT32) {
 				count++;
 			}
 		}
@@ -528,11 +677,16 @@ void count_queue(inttype *d_q, inttype q_size, inttype *firstbit_statevector, in
 void count_local_queue(inttype *q, inttype q_size, inttype *firstbit_statevector, inttype nr_procs, inttype sv_nints) {
 	int count = 0, newcount = 0;
 	inttype nw;
-	for (inttype i = 0; i < (q_size/WARPSIZE); i++) {
-		for (inttype j = 0; j < (WARPSIZE/sv_nints); j++) {
-			if (q[(i*WARPSIZE)+(j*sv_nints)+(sv_nints-1)] != EMPTYVECT32) {
+	inttype nrbuckets = q_size / WARPSIZE;
+	inttype nrels = NREL_IN_BUCKET_HOST;
+	for (inttype i = 0; i < nrbuckets; i++) {
+		for (inttype j = 0; j < nrels; j++) {
+			inttype elpos = STARTPOS_OF_EL_IN_BUCKET_HOST(j);
+			inttype abselpos = (i*WARPSIZE)+elpos+sv_nints-1;
+			inttype q_abselpos = q[abselpos];
+			if (q_abselpos != EMPTYVECT32) {
 				count++;
-				nw = ISNEWSTATE_HOST(&q[(i*WARPSIZE)+(j*sv_nints)]);
+				nw = ISNEWSTATE_HOST(&q[(i*WARPSIZE)+elpos]);
 				if (nw) {
 					newcount++;
 				}
@@ -558,17 +712,17 @@ __global__ void init_queue(inttype *d_q, inttype n_elem) {
  * CUDA kernel to store initial state in hash table
  */
 __global__ void store_initial(inttype *d_q, inttype *d_h) {
-	inttype bj, h;
-	uint64_t hashtmp;
+	inttype bj;
+	indextype hashtmp;
 	inttype state[MAX_SIZE];
 
 	for (bj = 0; bj < d_sv_nints; bj++) {
 		state[bj] = 0;
 	}
 	SETNEWSTATE(state);
-	FIRSTHASH(h, state);
+	FIRSTHASH(hashtmp, state);
 	for (bj = 0; bj < d_sv_nints; bj++) {
-		d_q[h+bj] = state[bj];
+		d_q[hashtmp+bj] = state[bj];
 	}
 }
 
@@ -600,8 +754,10 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 	inttype i, k, l, index, offset1, offset2, tmp, cont, act, sync_offset1, sync_offset2;
 	inttype src_state[MAX_SIZE], tgt_state[MAX_SIZE];
 	inttype bitmask, bi, bj, bk, bl;
-	uint64_t hashtmp;
+	indextype hashtmp;
 	int pos;
+	// TODO: remove this
+	inttype TMPVAR;
 	// is at least one outgoing transition enabled for a given state (needed to detect deadlocks)
 	inttype outtrans_enabled;
 
@@ -642,28 +798,20 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		if (scan || ITERATIONS == 0) {
 			for (i = GLOBAL_WARP_ID; i < d_nrbuckets && OPENTILECOUNT < OPENTILELEN; i += NR_WARPS) {
 				src_state[0] = d_q[(i*WARPSIZE)+LANE];
+				l = OPENTILELEN;
 				if (ENTRY_ID == (d_sv_nints-1)) {
 					if (ISNEWINT(src_state[0])) {
 						// try to increment the OPENTILECOUNT counter, if successful, store the state
-						l = atomicAdd((inttype *) &OPENTILECOUNT, d_sv_nints);
-						if (l >= OPENTILELEN) {
-							src_state[0] = 0;
-						}
-						else {
-							// vector has been claimed for exploration. make it old in the global hash table
+						l = atomicAdd((uint32_t *) &OPENTILECOUNT, d_sv_nints);
+						if (l < OPENTILELEN) {
 							d_q[(i*WARPSIZE)+LANE] = OLDINT(src_state[0]);
 						}
 					}
-					else {
-						src_state[0] = 0;
-					}
 				}
-				// all threads read the outcome of the above procedure, and if positive, store their part of the vector in the shared memory
+				// all threads read the OPENTILECOUNT value of the 'tail' thread, and possibly store their part of the vector in the shared memory
 				if (LANEPOINTSTOVALIDBUCKETPOS) {
-					k = __shfl(src_state[0], LANE-ENTRY_ID+d_sv_nints-1);
-					if (k != 0) {
-						// get offset l
-						l == __shfl(l, LANE-ENTRY_ID+d_sv_nints-1);
+					l = __shfl(l, LANE-ENTRY_ID+d_sv_nints-1);
+					if (l < OPENTILELEN) {
 						// write part of vector to shared memory
 						shared[OPENTILEOFFSET+l+ENTRY_ID] = src_state[0];
 					}
@@ -708,6 +856,8 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 				i = tex1Dfetch(tex_proc_offsets_start, GROUP_ID);
 				// Determine process state
 				GETSTATEVECTORSTATE(cont, src_state, GROUP_ID);
+				// TODO: remove
+				TMPVAR = cont;
 				// Offset position
 				index = cont/(INTSIZE/d_nbits_offset);
 				pos = cont - (index*(INTSIZE/d_nbits_offset));
@@ -737,6 +887,9 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		//int loopcounter = 0;
 		outtrans_enabled = 0;
 		while (CONTINUE == 1) {
+//			if (src_state[0] == 33026) { // label 31!
+//				PRINTTHREAD(0,0);
+//			}
 		// for (loopcounter = 0; loopcounter < 10000 && CONTINUE == 1; loopcounter++) {
 			if (offset1 < offset2 || cont) {
 				if (!cont) {
@@ -763,7 +916,7 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 									//printf ("%d %d\n", l, pos);
 									SETSTATEVECTORSTATE(tgt_state, GROUP_ID, pos-1);
 									// check for violation of safety property, if required
-									if (d_property == 2) {
+									if (d_property == SAFETY) {
 										if (GROUP_ID == d_nr_procs-1) {
 											// pos contains state id + 1
 											// error state is state 1
@@ -780,8 +933,8 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 									//printf ("storing\n");
 									//PRINTVECTOR(tgt_state);
 									// cache time-out; store directly in global hash table
-									if (STOREINCACHE(tgt_state, bi, bj, bk, bl, bitmask, hashtmp) > d_shared_q_size) {
-										if (FINDORPUT_SINGLE(tgt_state, d_q, bi, bj, bk, bl, bitmask, hashtmp)  == 0) {
+									if (STOREINCACHE(tgt_state, d_q, bi, bj, bk, bl, bitmask, hashtmp) > d_shared_q_size) {
+										if (FINDORPUT_SINGLE(tgt_state, d_q, bi, bj, bk, bl, hashtmp) == 0) {
 											// ERROR! hash table too full. Set CONTINUE to 2
 											CONTINUE = 2;
 										}
@@ -803,6 +956,9 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 					i = 0;
 					if (offset1 < offset2) {
 						GETPROCTRANSACT(act, tmp);
+//						if (src_state[0] == 33026 && act == 31) { // label 31!
+//							PRINTTHREAD(GROUP_ID,TMPVAR);
+//						}
 						//PRINTTHREAD(0, act);
 						// store transition entry
 						THREADBUFFERGROUPPOS(GROUP_ID,i) = tmp;
@@ -932,6 +1088,9 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 											//PRINTTHREAD(1, THREADBUFFERGROUPPOS(pos,0));
 											//PRINTTHREAD(2, k);
 											SETSTATEVECTORSTATE(tgt_state, pos, k-1);
+//											if (src_state[0] == 33026 && act == 31) { // label 31!
+//												PRINTTHREAD(pos,k-1);
+//											}
 										}
 									}
 									//PRINTVECTOR(tgt_state);
@@ -941,7 +1100,7 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 									// while we keep getting new states, store them
 									while (ISNEWSTATE(tgt_state)) {
 										// check for violation of safety property, if required
-										if (d_property == 2) {
+										if (d_property == SAFETY) {
 											GETSTATEVECTORSTATE(pos, tgt_state, d_nr_procs-1);
 											if (pos == 1) {
 												// error state found
@@ -964,12 +1123,17 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 										//	}
 										//}
 										// cache time-out; store directly in global hash table
-										if (STOREINCACHE(tgt_state, bi, bj, bk, bl, bitmask, hashtmp) > d_shared_q_size) {
-											if (FINDORPUT_SINGLE(d_q, tgt_state, bi, bj, bk, bl, bitmask, hashtmp) == 0) {
+										TMPVAR = STOREINCACHE(tgt_state, d_q, bi, bj, bk, bl, bitmask, hashtmp);
+										if (TMPVAR > d_shared_q_size) {
+											if (FINDORPUT_SINGLE(tgt_state, d_q, bi, bj, bk, bl, hashtmp) == 0) {
 												// ERROR! hash table too full. Set CONTINUE to 2
 												CONTINUE = 2;
 											}
 										}
+//										if (tgt_state[0] == 196866) { // src_state[0] == 33026, label 31! 196866
+//											PRINTTHREAD(555,TMPVAR);
+//											PRINTTHREAD(777,shared[CACHEOFFSET+TMPVAR]);
+//										}
 										// get next successor
 										for (pos = d_nr_procs-1; pos > (int) GROUP_ID-1; pos--) {
 											if (GETBIT(pos,tmp)) {
@@ -1049,7 +1213,7 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		} // END WHILE CONTINUE == 1
 		// have we encountered a deadlock state?
 		// we use the shared memory to communicate this to the group leaders
-		if (d_property == 1) {
+		if (d_property == DEADLOCK) {
 			if (THREADINGROUP) {
 				if (ISSTATE(src_state)) {
 					THREADBUFFERGROUPPOS(GROUP_ID, 0) = outtrans_enabled;
@@ -1086,10 +1250,12 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		// start scanning the local cache and write results to the global hash table
 		k = (d_shared_q_size-CACHEOFFSET)/d_sv_nints;
 		for (i = WARP_ID; i < k; i += (blockDim.x/WARPSIZE)) {
+//			if (shared[CACHEOFFSET+(i*d_sv_nints)] == 196866) { // src_state[0] == 33026, label 31!
+//				PRINTTHREAD(5,5);
+//			}
 			if (ISNEWSTATE(&shared[CACHEOFFSET+(i*d_sv_nints)])) {
 				// look for the state in the global hash table
-				FINDORPUT_WARP(l, &shared[CACHEOFFSET+(i*d_sv_nints)]);
-				if (l == 0) {
+				if (FINDORPUT_WARP((inttype*) &shared[CACHEOFFSET+(i*d_sv_nints)], d_q, bi, bj, bk, bl, bitmask, hashtmp) == 0) {
 					// ERROR: hash table is full
 					CONTINUE = 2;
 				}
@@ -1126,7 +1292,7 @@ int main(int argc, char** argv) {
 	size_t q_size = 0;
 	// size of open set
 	inttype opensize = 0;
-	inttype check_property = 0;
+	PropertyStatus check_property = NONE;
 	// nr of iterations in single kernel run
 	int kernel_iters = KERNEL_ITERS;
 	int nblocks = NR_OF_BLOCKS;
@@ -1201,12 +1367,12 @@ int main(int argc, char** argv) {
 		}
 		else if (!strcmp(argv[i],"-d")) {
 			// check for deadlocks
-			check_property = 1;
+			check_property = DEADLOCK;
 			i += 1;
 		}
-		else if (!strcmp(argv[i],"-s")) {
-			// check a safety property
-			check_property = 2;
+		else if (!strcmp(argv[i],"-p")) {
+			// check a property
+			check_property = SAFETY;
 			i += 1;
 		}
 	}
@@ -1214,6 +1380,18 @@ int main(int argc, char** argv) {
 	fp = fopen(fn, "r");
 	if (fp) {
 		// Read the input
+		fgets(stmp, BUFFERSIZE, fp);
+		if (check_property == SAFETY) {
+			i = atoi(stmp);
+			fprintf(stdout, "Property to check is ");
+			if (i == 0) {
+				fprintf(stdout, "not ");
+			}
+			fprintf(stdout, "a liveness property\n");
+			if (i == 1) {
+				check_property = LIVENESS;
+			}
+		}
 		fgets(stmp, BUFFERSIZE, fp);
 		nr_procs = atoi(stmp);
 		fprintf(stdout, "nr of procs: %d\n", nr_procs);
@@ -1291,10 +1469,27 @@ int main(int argc, char** argv) {
 	}
 
 	// Randomly define the closed set hash functions
-	srand(time(NULL));
-	for (int i = 0; i < NR_HASH_FUNCTIONS*2; i++) {
-		h[i] = rand();
-	}
+//	srand(time(NULL));
+//	for (int i = 0; i < NR_HASH_FUNCTIONS*2; i++) {
+//		h[i] = rand();
+//	}
+	// TODO: make random again
+	h[0] = 483319424;
+	h[1] = 118985421;
+	h[2] = 1287157904;
+	h[3] = 1162380012;
+	h[4] = 1231274815;
+	h[5] = 1344969351;
+	h[6] = 527997957;
+	h[7] = 735456672;
+	h[8] = 1774251664;
+	h[9] = 23102285;
+	h[10] = 2089529600;
+	h[11] = 2083003102;
+	h[12] = 908039861;
+	h[13] = 1913855526;
+	h[14] = 1515282600;
+	h[15] = 1691511413;
 
 	// continue flags
 	contBFS = 1;
@@ -1336,7 +1531,7 @@ int main(int argc, char** argv) {
 		exit(1);
 	}
 	cudaGetDeviceProperties(&prop, 0);
-	fprintf (stdout, "global mem: %d\n", (int) prop.totalGlobalMem);
+	fprintf (stdout, "global mem: %lu\n", (uint64_t) prop.totalGlobalMem);
 	fprintf (stdout, "shared mem per block: %d\n", (int) prop.sharedMemPerBlock);
 	fprintf (stdout, "max. threads per block: %d\n", (int) prop.maxThreadsPerBlock);
 	fprintf (stdout, "max. grid size: %d\n", (int) prop.maxGridSize[0]);
@@ -1349,6 +1544,9 @@ int main(int argc, char** argv) {
 	}
 	size_t el_per_Mb = Mb / sizeof(inttype);
 
+	// TODO: remove this fixing of q_size
+	q_size = 3200000;
+
 	while(cudaMalloc((void**)&d_q,  q_size * sizeof(inttype)) == cudaErrorMemoryAllocation)	{
 		q_size -= el_per_Mb;
 		if( q_size  < el_per_Mb) {
@@ -1356,7 +1554,8 @@ int main(int argc, char** argv) {
 			break;
 		}
 	}
-	fprintf (stdout, "global mem queue size: %lu, number of entries: %d\n", q_size*sizeof(int), (int) q_size);
+
+	fprintf (stdout, "global mem queue size: %lu, number of entries: %lu\n", q_size*sizeof(inttype), (indextype) q_size);
 
 	if (opensize == 0) {
 		opensize = q_size / 1000;
@@ -1389,7 +1588,7 @@ int main(int argc, char** argv) {
 	// init the queue
 	fprintf (stdout, "nr. of blocks: %d, block size: %d, nr of kernel iterations: %d\n", nblocks, nthreadsperblock, kernel_iters);
 	init_queue<<<nblocks, nthreadsperblock>>>(d_q, q_size);
-	//cudaMemset(d_q, 0, q_size*sizeof(uint64_t));
+	//cudaMemset(d_q, 0, q_size*sizeof(indextype));
 	store_initial<<<1,1>>>(d_q, d_h);
 	//print_queue(d_q, q_size, firstbit_statevector, nr_procs, sv_nints);
 	for (int i = 0; i < 2*NR_HASH_FUNCTIONS; i++) {
@@ -1415,6 +1614,7 @@ int main(int argc, char** argv) {
 	inttype scan = 0;
 	CUDA_CHECK_RETURN(cudaMemcpy(d_property_violation, &zero, sizeof(inttype), cudaMemcpyHostToDevice))
 	inttype property_violation = 0;
+	inttype itercount = 0;
 	while (contBFS == 1) {
 		CUDA_CHECK_RETURN(cudaMemcpy(d_contBFS, &zero, sizeof(inttype), cudaMemcpyHostToDevice))
 		gather<<<nblocks, nthreadsperblock, shared_q_size*sizeof(inttype)>>>(d_q, d_h, d_bits_state, d_firstbit_statevector, d_proc_offsets_start,
@@ -1439,13 +1639,18 @@ int main(int argc, char** argv) {
 			}
 			else if (verbosity == 3) {
 				cudaMemcpy(q_test, d_q, q_size*sizeof(inttype), cudaMemcpyDeviceToHost);
-				print_local_queue(q_test, q_size, firstbit_statevector, nr_procs, sv_nints);
+				print_local_queue(stdout, q_test, q_size, firstbit_statevector, nr_procs, sv_nints);
 			}
 		}
 		//j++;
 		//if (j == 1) {
 		scan = 1;
 		//}
+		// TODO: remove
+//		itercount++;
+//		if (itercount == 20) {
+//			break;
+//		}
 	}
 	// determine runtime
 	stop = clock();
@@ -1453,20 +1658,32 @@ int main(int argc, char** argv) {
 	fprintf (stdout, "Run time: %f\n", runtime);
 
 	if (property_violation == 1) {
-		if (check_property == 1) {
-			printf ("deadlock detected!\n");
-		}
-		else {
-			printf ("safety property violation detected!\n");
+		switch (check_property) {
+			case DEADLOCK:
+				printf ("deadlock detected!\n");
+				break;
+			case SAFETY:
+				printf ("safety property violation detected!\n");
+				break;
+			case LIVENESS:
+				printf ("liveness property violation detected!\n");
+				break;
 		}
 	}
 	// report error if required
-	//if (contBFS == 2) {
-	//	fprintf (stderr, "ERROR: problem with hash table\n");
-	//}
+	if (contBFS == 2) {
+		fprintf (stderr, "ERROR: problem with hash table\n");
+	}
 	//else {
-		count_queue(d_q, q_size, firstbit_statevector, nr_procs, sv_nints);
+	// TODO: uncomment
+	// count_queue(d_q, q_size, firstbit_statevector, nr_procs, sv_nints);
 	//}
+
+	FILE* fout;
+	fout = fopen("/home/awijs/output", "w");
+	cudaMemcpy(q_test, d_q, q_size*sizeof(inttype), cudaMemcpyDeviceToHost);
+	print_local_queue(fout, q_test, q_size, firstbit_statevector, nr_procs, sv_nints);
+	fclose(fout);
 
 	CUDA_CHECK_RETURN(cudaThreadSynchronize());	// Wait for the GPU launched work to complete
 	//CUDA_CHECK_RETURN(cudaGetLastError());
