@@ -24,7 +24,10 @@
 #define indextype uint64_t
 
 enum BucketEntryStatus { EMPTY, TAKEN, FOUND };
+<<<<<<< HEAD
 enum PropertyStatus { NONE, DEADLOCK, SAFETY, LIVENESS };
+=======
+>>>>>>> refs/remotes/origin/master
 
 #define MIN(a,b) \
    ({ __typeof__ (a) _a = (a); \
@@ -54,7 +57,11 @@ __constant__ inttype d_bits_act;
 __constant__ inttype d_nbits_offset;
 __constant__ inttype d_kernel_iters;
 __constant__ inttype d_nbits_syncbits_offset;
+<<<<<<< HEAD
 __constant__ PropertyStatus d_property;
+=======
+__constant__ inttype d_property;
+>>>>>>> refs/remotes/origin/master
 
 // GPU shared memory array
 extern volatile __shared__ inttype shared[];
@@ -91,8 +98,13 @@ static const int SH_OFFSET = 3;
 //static const int KERNEL_ITERS = 10;
 //static const int NR_OF_BLOCKS = 3120;
 //static const int BLOCK_SIZE = 512;
+<<<<<<< HEAD
 static const int KERNEL_ITERS = 10;
 static const int NR_OF_BLOCKS = 2;
+=======
+static const int KERNEL_ITERS = 1;
+static const int NR_OF_BLOCKS = 1;
+>>>>>>> refs/remotes/origin/master
 static const int BLOCK_SIZE = 512;
 const size_t Mb = 1<<20;
 
