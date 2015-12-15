@@ -133,9 +133,9 @@ const size_t Mb = 1<<20;
 
 // BIT MANIPULATION MACROS
 
-#define SETBIT(i, x)							{(x) = ((((inttype) 1)<<(i)) | (x));}
-#define GETBIT(i, x)							(((x) >> (i)) & ((inttype) 1))
-#define SETBITS(i, j, x)						for (bi = (i); bi < (j); bi++) { (x) = (x) | (((inttype) 1)<<bi); }
+#define SETBIT(i, x)							{(x) = ((1L<<(i)) | (x));}
+#define GETBIT(i, x)							(((x) >> (i)) & 1L)
+#define SETBITS(i, j, x)						{(x) = (x) | (((1L<<(j))-1)^((1L<<(i))-1));}
 #define GETPROCTRANSACT(a, t)					{bitmask = 0; SETBITS(1, 1+d_bits_act, bitmask); (a) = ((t) & bitmask) >> 1;}
 #define GETPROCTRANSSYNC(a, t)					{(a) = ((t) & 1);}
 #define GETPROCTRANSSTATE(a, t, i, j)			{bitmask = 0; SETBITS(1+d_bits_act+((i)-1)*shared[LTSSTATESIZEOFFSET+(j)], \
@@ -145,12 +145,12 @@ const size_t Mb = 1<<20;
 #define GETSYNCOFFSET(a, t, i)					{bitmask = 0; SETBITS((i)*d_nbits_syncbits_offset, ((i)+1)*d_nbits_syncbits_offset, bitmask); \
 													(a) = ((t) & bitmask) >> ((i)*d_nbits_syncbits_offset);}
 #define GETSTATEVECTORSTATE(a, t, i)			{bitmask = 0; 	if (shared[VECTORPOSOFFSET+(i)]/INTSIZE == (shared[VECTORPOSOFFSET+(i)+1]-1)/INTSIZE) { \
-																	SETBITS(shared[VECTORPOSOFFSET+(i)] % INTSIZE, \
-																			((shared[VECTORPOSOFFSET+(i)+1]-1) % INTSIZE)+1, bitmask); \
+																	SETBITS((shared[VECTORPOSOFFSET+(i)] % INTSIZE), \
+																			(((shared[VECTORPOSOFFSET+(i)+1]-1) % INTSIZE)+1), bitmask); \
 																	(a) = ((t)[shared[VECTORPOSOFFSET+(i)]/INTSIZE] & bitmask) >> (shared[VECTORPOSOFFSET+(i)] % INTSIZE); \
 																} \
 																else { \
-																	SETBITS(0,shared[VECTORPOSOFFSET+(i)+1] % INTSIZE,bitmask); \
+																	SETBITS(0,(shared[VECTORPOSOFFSET+(i)+1] % INTSIZE),bitmask); \
 																	(a) = (t)[shared[VECTORPOSOFFSET+(i)]/INTSIZE] >> (shared[VECTORPOSOFFSET+(i)] % INTSIZE) \
 																		 | \
 																		((t)[shared[VECTORPOSOFFSET+(i)+1]/INTSIZE] & bitmask) << \
@@ -162,17 +162,17 @@ const size_t Mb = 1<<20;
 #define SETPROCTRANSSTATE(t, i, x, j)			{bitmask = 0; SETBITS(1+d_bits_act+((i)-1)*shared[LTSSTATESIZEOFFSET+(j)],1+d_bits_act+(i)*shared[LTSSTATESIZEOFFSET+(j)],bitmask); \
 													(t) = ((t) & ~bitmask) | ((x) << (1+d_bits_act+((i)-1)*shared[LTSSTATESIZEOFFSET+(j)]));}
 #define SETSTATEVECTORSTATE(t, i, x)			{bitmask = 0; 	if (shared[VECTORPOSOFFSET+(i)]/INTSIZE == (shared[VECTORPOSOFFSET+(i)+1]-1)/INTSIZE) { \
-																	SETBITS(shared[VECTORPOSOFFSET+(i)] % INTSIZE, \
-																			((shared[VECTORPOSOFFSET+(i)+1]-1) % INTSIZE)+1,bitmask); \
+																	SETBITS((shared[VECTORPOSOFFSET+(i)] % INTSIZE), \
+																			(((shared[VECTORPOSOFFSET+(i)+1]-1) % INTSIZE)+1),bitmask); \
 																	(t)[shared[VECTORPOSOFFSET+(i)]/INTSIZE] = ((t)[shared[VECTORPOSOFFSET+(i)]/INTSIZE] & ~bitmask) | \
 																	((x) << (shared[VECTORPOSOFFSET+(i)] % INTSIZE)); \
 																} \
 																else { \
-																	SETBITS(0,shared[VECTORPOSOFFSET+(i)] % INTSIZE, bitmask); \
+																	SETBITS(0,(shared[VECTORPOSOFFSET+(i)] % INTSIZE), bitmask); \
 																	(t)[shared[VECTORPOSOFFSET+(i)]/INTSIZE] = ((t)[shared[VECTORPOSOFFSET+(i)]/INTSIZE] & bitmask) | \
 																	((x) << (shared[VECTORPOSOFFSET+(i)] % INTSIZE)); \
 																	bitmask = 0; \
-																	SETBITS(shared[VECTORPOSOFFSET+(i)+1] % INTSIZE, INTSIZE, bitmask); \
+																	SETBITS((shared[VECTORPOSOFFSET+(i)+1] % INTSIZE), INTSIZE, bitmask); \
 																	(t)[shared[VECTORPOSOFFSET+(i)+1]/INTSIZE] = ((t)[shared[VECTORPOSOFFSET+(i)+1]/INTSIZE] & bitmask) | \
 																		((x) >> (INTSIZE - (shared[VECTORPOSOFFSET+(i)] % INTSIZE))); \
 																} \
@@ -584,7 +584,7 @@ int cudaMallocCount ( void ** ptr,int size) {
 
 //test function to print a given state vector
 void print_statevector(FILE* stream, inttype *state, inttype *firstbit_statevector, inttype nr_procs, inttype sv_nints) {
-	inttype i, s, bitmask, bi;
+	inttype i, s, bitmask;
 
 	for (i = 0; i < nr_procs; i++) {
 		bitmask = 0;
@@ -1614,7 +1614,7 @@ int main(int argc, char** argv) {
 	inttype scan = 0;
 	CUDA_CHECK_RETURN(cudaMemcpy(d_property_violation, &zero, sizeof(inttype), cudaMemcpyHostToDevice))
 	inttype property_violation = 0;
-	inttype itercount = 0;
+	//inttype itercount = 0;
 	while (contBFS == 1) {
 		CUDA_CHECK_RETURN(cudaMemcpy(d_contBFS, &zero, sizeof(inttype), cudaMemcpyHostToDevice))
 		gather<<<nblocks, nthreadsperblock, shared_q_size*sizeof(inttype)>>>(d_q, d_h, d_bits_state, d_firstbit_statevector, d_proc_offsets_start,
