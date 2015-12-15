@@ -4,7 +4,7 @@
  Author      : Anton Wijs
  Version     :
  Copyright   : Copyright Anton Wijs
- Description : CUDA compute reciprocals
+ Description : CUDA GPUexplore: On the fly state space analysis
  ============================================================================
  */
 
