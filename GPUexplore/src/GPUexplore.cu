@@ -105,7 +105,7 @@ const size_t Mb = 1<<20;
 #define VECTORPOSLEN					(d_nr_procs+1)
 #define LTSSTATESIZELEN					(d_nr_procs)
 #define OPENTILELEN						(d_sv_nints*(blockDim.x/d_nr_procs))
-#define THREADBUFFERLEN					((blockDim.x/d_nr_procs)*(1+(d_nr_procs*d_max_buf_ints)))
+#define THREADBUFFERLEN					((blockDim.x/d_nr_procs)*(THREADBUFFERSHARED+(d_nr_procs*d_max_buf_ints)))
 
 #define HASHCONSTANTSOFFSET 			(SH_OFFSET)
 #define VECTORPOSOFFSET 				(SH_OFFSET+HASHCONSTANTSLEN)
@@ -114,11 +114,15 @@ const size_t Mb = 1<<20;
 #define THREADBUFFEROFFSET	 			(SH_OFFSET+HASHCONSTANTSLEN+VECTORPOSLEN+LTSSTATESIZELEN+OPENTILELEN)
 #define CACHEOFFSET 					(SH_OFFSET+HASHCONSTANTSLEN+VECTORPOSLEN+LTSSTATESIZELEN+OPENTILELEN+THREADBUFFERLEN)
 
+// One int for sync action counter
+// One int for POR counter
+#define THREADBUFFERSHARED				2
 // parameter is thread id
-#define THREADBUFFERGROUPSTART(i)		(THREADBUFFEROFFSET+(((i) / d_nr_procs)*(1+(d_nr_procs*d_max_buf_ints))))
+#define THREADBUFFERGROUPSTART(i)		(THREADBUFFEROFFSET+(((i) / d_nr_procs)*(THREADBUFFERSHARED+(d_nr_procs*d_max_buf_ints))))
 // parameter is group id
-#define THREADBUFFERGROUPPOS(i, j)		shared[THREADBUFFERGROUPSTART(threadIdx.x)+1+((i)*d_max_buf_ints)+(j)]
+#define THREADBUFFERGROUPPOS(i, j)		shared[THREADBUFFERGROUPSTART(threadIdx.x)+THREADBUFFERSHARED+((i)*d_max_buf_ints)+(j)]
 #define THREADGROUPCOUNTER				shared[(THREADBUFFERGROUPSTART(threadIdx.x))]
+#define THREADGROUPPOR					shared[(THREADBUFFERGROUPSTART(threadIdx.x)) + 1]
 #define OPENTILESTATEPART(i)			shared[OPENTILEOFFSET+(d_sv_nints*(threadIdx.x / d_nr_procs))+(i)]
 
 #define THREADINGROUP					(threadIdx.x < (blockDim.x/d_nr_procs)*d_nr_procs)
@@ -463,6 +467,35 @@ __device__ inttype FINDORPUT_WARP(inttype* t, inttype* d_q, inttype bi, inttype 
 	return 0;
 }
 
+// find element, warp version. t is element stored in block cache
+__device__ inttype FIND_WARP(inttype* t, inttype* d_q, inttype bi, inttype bj, inttype bk, inttype bl, inttype bitmask, indextype hashtmp)	{
+	// prepare bitmask once to reason about results of threads in the same (state vector) group
+	bitmask = 0;
+	if (LANEPOINTSTOVALIDBUCKETPOS) {
+		SETBITS(LANE-ENTRY_ID, LANE-ENTRY_ID+d_sv_nints, bitmask);
+	}
+	for (bi = 0; bi < NR_HASH_FUNCTIONS; bi++) {
+		HASHFUNCTION(hashtmp, bi, t);
+		bl = d_q[hashtmp+LANE];
+		bk = __ballot(STRIPPEDENTRY(bl, ENTRY_ID) == STRIPPEDSTATE(t, ENTRY_ID));
+		// bj is used to determine whether full state vector has been found
+		bj = 0;
+		if (LANEPOINTSTOVALIDBUCKETPOS) {
+			if (bk & bitmask == bitmask) {
+				bj = 1;
+			}
+		}
+		if (__any(bj == 1) != 0) {
+			// state vector has been found in bucket. mark local copy as old.
+			if (LANE == 0) {
+				SETOLDSTATE(t);
+			}
+			return 1;
+		}
+	}
+	return 0;
+}
+
 __device__ inttype FINDORPUT_WARP_ORIG(inttype* t, inttype* d_q, inttype bi, inttype bj, inttype bk, inttype bl, inttype bitmask, indextype hashtmp) {
 	for (bi = 0; bi < NR_HASH_FUNCTIONS; bi++) {
 		HASHFUNCTION(hashtmp, bi, t);
@@ -751,7 +784,7 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 						inttype *d_syncbits, inttype *d_contBFS, inttype *d_property_violation, inttype scan) {
 	//inttype global_id = (blockIdx.x * blockDim.x) + threadIdx.x;
 	//inttype group_nr = threadIdx.x / nr_procs;
-	inttype i, k, l, index, offset1, offset2, tmp, cont, act, sync_offset1, sync_offset2;
+	inttype i, k, l, index, offset1, offset2, tmp, cont, act, sync_offset1, sync_offset2, local_action_counter;
 	inttype src_state[MAX_SIZE], tgt_state[MAX_SIZE];
 	inttype bitmask, bi, bj, bk, bl;
 	indextype hashtmp;
@@ -886,6 +919,7 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		// while there is work to be done
 		//int loopcounter = 0;
 		outtrans_enabled = 0;
+		local_action_counter = 0;
 		while (CONTINUE == 1) {
 //			if (src_state[0] == 33026) { // label 31!
 //				PRINTTHREAD(0,0);
@@ -933,11 +967,17 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 									//printf ("storing\n");
 									//PRINTVECTOR(tgt_state);
 									// cache time-out; store directly in global hash table
-									if (STOREINCACHE(tgt_state, d_q, bi, bj, bk, bl, bitmask, hashtmp) > d_shared_q_size) {
+									k =	STOREINCACHE(tgt_state, d_q, bi, bj, bk, bl, bitmask, hashtmp);
+									//PRINTTHREAD(1, local_action_counter);
+									if (k > d_shared_q_size) {
 										if (FINDORPUT_SINGLE(tgt_state, d_q, bi, bj, bk, bl, hashtmp) == 0) {
 											// ERROR! hash table too full. Set CONTINUE to 2
 											CONTINUE = 2;
 										}
+									} else if(k < d_shared_q_size){
+										THREADBUFFERGROUPPOS(GROUP_ID,local_action_counter) = k;
+										//FIXME use half integers
+										local_action_counter++;
 									}
 								}
 								else {
@@ -977,14 +1017,61 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 								break;
 							}
 						}
+					} else {
+						THREADGROUPPOR = 0x80000000 | d_nr_procs;
 					}
 				}
 			}
 			// group leaders now need to set the counter to the next minimal action value.
-			// To avoid bank conflicts afterwards when threads would need to read THREADGROUPCOUNTER,
+			// To avoid bank conflicts afterwards when threads would need to read GETTHREADGROUPCOUNTER,
 			// the leader disables the SYNC bit of transition entries for those threads which need
 			// to perform work next. In this way, threads can determine locally that they should proceed
 			// without reading the counter.
+			__syncthreads();
+			k = (d_shared_q_size-CACHEOFFSET)/d_sv_nints;
+			for (i = 0; i < local_action_counter + 1;) {
+				int active_lane = __ffs(__ballot(i < local_action_counter)) - 1;
+				if(active_lane == -1) {
+					break;
+				}
+				int cache_index = __shfl(active_lane == LANE ? THREADBUFFERGROUPPOS(GROUP_ID,i++) : 0, active_lane);
+				FIND_WARP((inttype*) &shared[CACHEOFFSET+cache_index], d_q, bi, bj, bk, bl, bitmask, hashtmp);
+			}
+			__syncthreads();
+			if(THREADGROUPPOR != 0) {
+				for(i = 0; i < local_action_counter; i++) {
+//					PRINTTHREAD(0,i);
+//					PRINTTHREAD(1,THREADBUFFERGROUPPOS(GROUP_ID,i));
+					if(ISNEWSTATE( &shared[CACHEOFFSET+THREADBUFFERGROUPPOS(GROUP_ID,i)] )) {
+//						PRINTTHREAD(2,OLDINT(shared[CACHEOFFSET+THREADBUFFERGROUPPOS(GROUP_ID,i)]));
+						atomicMin((int*)&THREADGROUPPOR, 0x80000000 | GROUP_ID);
+						break;
+					}
+				}
+			}
+			__syncthreads();
+			if(THREADGROUPPOR < (0x80000000 | d_nr_procs) && THREADGROUPPOR != 0) {
+				// Cycle proviso is satisfied
+				for(i = 0; i < local_action_counter; i++) {
+//					PRINTTHREAD(3,THREADGROUPPOR & 0x7FFFFFFF);
+//					PRINTTHREAD(4,GROUP_ID);
+					if((THREADGROUPPOR & 0x7FFFFFFF) != GROUP_ID) {
+//						PRINTTHREAD(4,shared[CACHEOFFSET+THREADBUFFERGROUPPOS(GROUP_ID,i)]);
+						SETOLDSTATE( &shared[CACHEOFFSET+THREADBUFFERGROUPPOS(GROUP_ID,i)] );
+					}
+					THREADBUFFERGROUPPOS(GROUP_ID,i) = 0;
+				}
+				cont = 0;
+				if (THREADINGROUP && GROUP_ID == 0) {
+					THREADGROUPCOUNTER = EXPLORATION_DONE;
+					THREADGROUPPOR = 0;
+				}
+			} else {
+				for(i = 0; i < local_action_counter; i++) {
+					THREADBUFFERGROUPPOS(GROUP_ID,i) = 0;
+				}
+			}
+			local_action_counter = 0;
 			__syncthreads();
 			if (THREADINGROUP) {
 				if (GROUP_ID == 0) {
@@ -1680,7 +1767,7 @@ int main(int argc, char** argv) {
 	//}
 
 	FILE* fout;
-	fout = fopen("/home/awijs/output", "w");
+	fout = fopen("/tmp/gpuexplore.debug", "w");
 	cudaMemcpy(q_test, d_q, q_size*sizeof(inttype), cudaMemcpyDeviceToHost);
 	print_local_queue(fout, q_test, q_size, firstbit_statevector, nr_procs, sv_nints);
 	fclose(fout);
