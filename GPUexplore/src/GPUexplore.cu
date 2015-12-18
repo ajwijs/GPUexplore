@@ -92,8 +92,8 @@ static const int SH_OFFSET = 3;
 //static const int NR_OF_BLOCKS = 3120;
 //static const int BLOCK_SIZE = 512;
 static const int KERNEL_ITERS = 1;
-static const int NR_OF_BLOCKS = 2;
-static const int BLOCK_SIZE = 512;
+static const int NR_OF_BLOCKS = 1;
+static const int BLOCK_SIZE = 192;
 const size_t Mb = 1<<20;
 
 // test macros
@@ -784,7 +784,8 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 						inttype *d_syncbits, inttype *d_contBFS, inttype *d_property_violation, inttype scan) {
 	//inttype global_id = (blockIdx.x * blockDim.x) + threadIdx.x;
 	//inttype group_nr = threadIdx.x / nr_procs;
-	inttype i, k, l, index, offset1, offset2, tmp, cont, act, sync_offset1, sync_offset2, local_action_counter;
+	inttype i, k, l, index, offset1, offset2, tmp, cont, act, sync_offset1, sync_offset2;
+	int32_t local_action_counter;
 	inttype src_state[MAX_SIZE], tgt_state[MAX_SIZE];
 	inttype bitmask, bi, bj, bk, bl;
 	indextype hashtmp;
@@ -907,6 +908,7 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 			if (GROUP_ID == 0) {
 				// for later, when constructing successors for this state, set action counter to maximum
 				THREADGROUPCOUNTER = (1 << d_bits_act);
+				THREADGROUPPOR = 0;
 			}
 		}
 		// iterate over the outgoing transitions of state 'cont'
@@ -962,22 +964,18 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 									}
 									// store tgt_state in cache; if i == d_shared_q_size, state was found, duplicate detected
 									// if i == d_shared_q_size+1, cache is full, immediately store in global hash table
-									//printf ("src\n");
-									//PRINTVECTOR(src_state);
-									//printf ("storing\n");
-									//PRINTVECTOR(tgt_state);
-									// cache time-out; store directly in global hash table
 									k =	STOREINCACHE(tgt_state, d_q, bi, bj, bk, bl, bitmask, hashtmp);
-									//PRINTTHREAD(1, local_action_counter);
 									if (k > d_shared_q_size) {
+										// cache time-out; store directly in global hash table
 										if (FINDORPUT_SINGLE(tgt_state, d_q, bi, bj, bk, bl, hashtmp) == 0) {
 											// ERROR! hash table too full. Set CONTINUE to 2
 											CONTINUE = 2;
 										}
-									} else if(k < d_shared_q_size){
+									} else if(local_action_counter != -1 && k < d_shared_q_size - CACHEOFFSET){
 										THREADBUFFERGROUPPOS(GROUP_ID,local_action_counter) = k;
-										//FIXME use half integers
 										local_action_counter++;
+//									} else if(k != d_shared_q_size){
+//										printf("thread %d got a strange cache index: %d\n", threadIdx.x, k);
 									}
 								}
 								else {
@@ -1022,56 +1020,57 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 					}
 				}
 			}
-			// group leaders now need to set the counter to the next minimal action value.
-			// To avoid bank conflicts afterwards when threads would need to read GETTHREADGROUPCOUNTER,
-			// the leader disables the SYNC bit of transition entries for those threads which need
-			// to perform work next. In this way, threads can determine locally that they should proceed
-			// without reading the counter.
-			__syncthreads();
+			// All states following from local transitions
+			// are now checked in global memory to see if
+			// they are new.
 			k = (d_shared_q_size-CACHEOFFSET)/d_sv_nints;
-			for (i = 0; i < local_action_counter + 1;) {
-				int active_lane = __ffs(__ballot(i < local_action_counter)) - 1;
+			int por_possible = 0;
+			for (int32_t c = 0; c < local_action_counter + 1;) {
+				int active_lane = __ffs(__ballot(c < local_action_counter)) - 1;
 				if(active_lane == -1) {
 					break;
 				}
-				int cache_index = __shfl(active_lane == LANE ? THREADBUFFERGROUPPOS(GROUP_ID,i++) : 0, active_lane);
-				FIND_WARP((inttype*) &shared[CACHEOFFSET+cache_index], d_q, bi, bj, bk, bl, bitmask, hashtmp);
-			}
-			__syncthreads();
-			if(THREADGROUPPOR != 0) {
-				for(i = 0; i < local_action_counter; i++) {
-//					PRINTTHREAD(0,i);
-//					PRINTTHREAD(1,THREADBUFFERGROUPPOS(GROUP_ID,i));
-					if(ISNEWSTATE( &shared[CACHEOFFSET+THREADBUFFERGROUPPOS(GROUP_ID,i)] )) {
-//						PRINTTHREAD(2,OLDINT(shared[CACHEOFFSET+THREADBUFFERGROUPPOS(GROUP_ID,i)]));
-						atomicMin((int*)&THREADGROUPPOR, 0x80000000 | GROUP_ID);
-						break;
-					}
+				volatile int cache_index = __shfl(active_lane == LANE ? THREADBUFFERGROUPPOS(GROUP_ID,c++) : 0, active_lane);
+				if(FIND_WARP((inttype*) &shared[CACHEOFFSET+cache_index], d_q, bi, bj, bk, bl, bitmask, hashtmp) == 0) {
+					por_possible |= active_lane == LANE;
 				}
 			}
+			if(por_possible) {
+				// At least one state following from a local
+				// transition is new, report that POR
+				// can be applied.
+				atomicMin((int*)&THREADGROUPPOR, 0x80000000 | GROUP_ID);
+			}
 			__syncthreads();
+			// Apply partial-order reduction by only retaining
+			// new states from one thread as new.
+			// Reset some variables to prevent further successor
+			// generation.
 			if(THREADGROUPPOR < (0x80000000 | d_nr_procs) && THREADGROUPPOR != 0) {
 				// Cycle proviso is satisfied
-				for(i = 0; i < local_action_counter; i++) {
-//					PRINTTHREAD(3,THREADGROUPPOR & 0x7FFFFFFF);
-//					PRINTTHREAD(4,GROUP_ID);
+				for(int32_t c = 0; c < local_action_counter; c++) {
 					if((THREADGROUPPOR & 0x7FFFFFFF) != GROUP_ID) {
-//						PRINTTHREAD(4,shared[CACHEOFFSET+THREADBUFFERGROUPPOS(GROUP_ID,i)]);
-						SETOLDSTATE( &shared[CACHEOFFSET+THREADBUFFERGROUPPOS(GROUP_ID,i)] );
+						SETOLDSTATE( &shared[CACHEOFFSET+THREADBUFFERGROUPPOS(GROUP_ID,c)] );
 					}
-					THREADBUFFERGROUPPOS(GROUP_ID,i) = 0;
+					THREADBUFFERGROUPPOS(GROUP_ID,c) = 0;
 				}
 				cont = 0;
+				offset1 = offset2;
 				if (THREADINGROUP && GROUP_ID == 0) {
 					THREADGROUPCOUNTER = EXPLORATION_DONE;
 					THREADGROUPPOR = 0;
 				}
 			} else {
-				for(i = 0; i < local_action_counter; i++) {
-					THREADBUFFERGROUPPOS(GROUP_ID,i) = 0;
+				for(int32_t c = 0; c < local_action_counter; c++) {
+					THREADBUFFERGROUPPOS(GROUP_ID,c) = 0;
 				}
 			}
-			local_action_counter = 0;
+			local_action_counter = -1;
+			// group leaders now need to set the counter to the next minimal action value.
+			// To avoid bank conflicts afterwards when threads would need to read GETTHREADGROUPCOUNTER,
+			// the leader disables the SYNC bit of transition entries for those threads which need
+			// to perform work next. In this way, threads can determine locally that they should proceed
+			// without reading the counter.
 			__syncthreads();
 			if (THREADINGROUP) {
 				if (GROUP_ID == 0) {
@@ -1631,8 +1630,6 @@ int main(int argc, char** argv) {
 	}
 	size_t el_per_Mb = Mb / sizeof(inttype);
 
-	// TODO: remove this fixing of q_size
-	q_size = 3200000;
 
 	while(cudaMalloc((void**)&d_q,  q_size * sizeof(inttype)) == cudaErrorMemoryAllocation)	{
 		q_size -= el_per_Mb;
