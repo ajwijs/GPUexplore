@@ -92,8 +92,8 @@ static const int SH_OFFSET = 3;
 //static const int NR_OF_BLOCKS = 3120;
 //static const int BLOCK_SIZE = 512;
 static const int KERNEL_ITERS = 1;
-static const int NR_OF_BLOCKS = 1;
-static const int BLOCK_SIZE = 192;
+static const int NR_OF_BLOCKS = 6;
+static const int BLOCK_SIZE = 512;
 const size_t Mb = 1<<20;
 
 // test macros
@@ -219,8 +219,10 @@ const size_t Mb = 1<<20;
 
 // HASH TABLE MACROS
 
-// Return d_shared_q_size if duplicate found, d_shared_q_size+1 if cache is full
-__device__ inttype STOREINCACHE(inttype* t, inttype* d_q, inttype bi, inttype bj, inttype bk, inttype bl, inttype bitmask, indextype hashtmp) {
+// Return 0 if not found, 1 if found, 2 if cache is full
+__device__ inttype STOREINCACHE(inttype* t, inttype* d_q, inttype* address) {
+	inttype bi, bj, bk, bl, bitmask;
+	indextype hashtmp;
 	STRIPSTATE(t);
 	hashtmp = 0;
 	for (bi = 0; bi < d_sv_nints; bi++) {
@@ -235,11 +237,13 @@ __device__ inttype STOREINCACHE(inttype* t, inttype* d_q, inttype bi, inttype bj
 			for (bj = 0; bj < d_sv_nints-1; bj++) {
 				shared[CACHEOFFSET+bitmask+bj] = t[bj];
 			}
-			return bitmask;
+			*address = bitmask;
+			return 0;
 		}
 		if (COMPAREENTRIES(bi, t[d_sv_nints-1])) {
 			if (d_sv_nints == 1) {
-				return d_shared_q_size;
+				*address = bitmask;
+				return 1;
 			}
 			else {
 				for (bj = 0; bj < d_sv_nints-1; bj++) {
@@ -248,7 +252,8 @@ __device__ inttype STOREINCACHE(inttype* t, inttype* d_q, inttype bi, inttype bj
 					}
 				}
 				if (bj == d_sv_nints-1) {
-					return d_shared_q_size;
+					*address = bitmask;
+					return 1;
 				}
 			}
 		}
@@ -258,7 +263,8 @@ __device__ inttype STOREINCACHE(inttype* t, inttype* d_q, inttype bi, inttype bj
 				for (bk = 0; bk < d_sv_nints-1; bk++) {
 					shared[CACHEOFFSET+bitmask+bk] = t[bk];
 				}
-				return bitmask;
+				*address = bitmask;
+				return 0;
 			}
 		}
 		bl++;
@@ -267,7 +273,7 @@ __device__ inttype STOREINCACHE(inttype* t, inttype* d_q, inttype bi, inttype bj
 			bitmask = 0;
 		}
 	}
-	return d_shared_q_size+1;
+	return 2;
 }
 
 // hash functions use bj variable
@@ -469,6 +475,7 @@ __device__ inttype FINDORPUT_WARP(inttype* t, inttype* d_q, inttype bi, inttype 
 
 // find element, warp version. t is element stored in block cache
 __device__ inttype FIND_WARP(inttype* t, inttype* d_q, inttype bi, inttype bj, inttype bk, inttype bl, inttype bitmask, indextype hashtmp)	{
+	BucketEntryStatus threadstatus;
 	// prepare bitmask once to reason about results of threads in the same (state vector) group
 	bitmask = 0;
 	if (LANEPOINTSTOVALIDBUCKETPOS) {
@@ -478,19 +485,28 @@ __device__ inttype FIND_WARP(inttype* t, inttype* d_q, inttype bi, inttype bj, i
 		HASHFUNCTION(hashtmp, bi, t);
 		bl = d_q[hashtmp+LANE];
 		bk = __ballot(STRIPPEDENTRY(bl, ENTRY_ID) == STRIPPEDSTATE(t, ENTRY_ID));
-		// bj is used to determine whether full state vector has been found
-		bj = 0;
+		// threadstatus is used to determine whether full state vector has been found
+		threadstatus = EMPTY;
 		if (LANEPOINTSTOVALIDBUCKETPOS) {
-			if (bk & bitmask == bitmask) {
-				bj = 1;
+			if ((bk & bitmask) == bitmask) {
+				threadstatus = FOUND;
 			}
 		}
-		if (__any(bj == 1) != 0) {
+		if (__ballot(threadstatus == FOUND) != 0) {
 			// state vector has been found in bucket. mark local copy as old.
-			if (LANE == 0) {
+			if (threadstatus == FOUND && ENTRY_ID == 0) {
 				SETOLDSTATE(t);
 			}
 			return 1;
+		}
+		// try to find empty position to insert new state vector
+		threadstatus = (bl == EMPTYVECT32 && LANEPOINTSTOVALIDBUCKETPOS) ? EMPTY : TAKEN;
+		// let bk hold the smallest index of an available empty position
+		bk = __ffs(__ballot(threadstatus == EMPTY));
+		if(bk < 32) {
+			// There is an empty slot in this bucket and the state vector was not found
+			// State will also not be found after rehashing, so we return 0
+			return 0;
 		}
 	}
 	return 0;
@@ -964,18 +980,16 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 									}
 									// store tgt_state in cache; if i == d_shared_q_size, state was found, duplicate detected
 									// if i == d_shared_q_size+1, cache is full, immediately store in global hash table
-									k =	STOREINCACHE(tgt_state, d_q, bi, bj, bk, bl, bitmask, hashtmp);
-									if (k > d_shared_q_size) {
+									k = STOREINCACHE(tgt_state, d_q, &bi);
+									if (k == 2) {
 										// cache time-out; store directly in global hash table
 										if (FINDORPUT_SINGLE(tgt_state, d_q, bi, bj, bk, bl, hashtmp) == 0) {
 											// ERROR! hash table too full. Set CONTINUE to 2
 											CONTINUE = 2;
 										}
-									} else if(local_action_counter != -1 && k < d_shared_q_size - CACHEOFFSET){
-										THREADBUFFERGROUPPOS(GROUP_ID,local_action_counter) = k;
+									} else if(local_action_counter != -1 && k == 0){
+										THREADBUFFERGROUPPOS(GROUP_ID,local_action_counter) = bi;
 										local_action_counter++;
-//									} else if(k != d_shared_q_size){
-//										printf("thread %d got a strange cache index: %d\n", threadIdx.x, k);
 									}
 								}
 								else {
@@ -1030,7 +1044,7 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 				if(active_lane == -1) {
 					break;
 				}
-				volatile int cache_index = __shfl(active_lane == LANE ? THREADBUFFERGROUPPOS(GROUP_ID,c++) : 0, active_lane);
+				int cache_index = __shfl(active_lane == LANE ? THREADBUFFERGROUPPOS(GROUP_ID,c++) : 0, active_lane);
 				if(FIND_WARP((inttype*) &shared[CACHEOFFSET+cache_index], d_q, bi, bj, bk, bl, bitmask, hashtmp) == 0) {
 					por_possible |= active_lane == LANE;
 				}
@@ -1209,8 +1223,8 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 										//	}
 										//}
 										// cache time-out; store directly in global hash table
-										TMPVAR = STOREINCACHE(tgt_state, d_q, bi, bj, bk, bl, bitmask, hashtmp);
-										if (TMPVAR > d_shared_q_size) {
+										TMPVAR = STOREINCACHE(tgt_state, d_q, &bitmask);
+										if (TMPVAR == 2) {
 											if (FINDORPUT_SINGLE(tgt_state, d_q, bi, bj, bk, bl, hashtmp) == 0) {
 												// ERROR! hash table too full. Set CONTINUE to 2
 												CONTINUE = 2;
