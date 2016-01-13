@@ -92,8 +92,8 @@ static const int SH_OFFSET = 3;
 //static const int NR_OF_BLOCKS = 3120;
 //static const int BLOCK_SIZE = 512;
 static const int KERNEL_ITERS = 1;
-static const int NR_OF_BLOCKS = 6;
-static const int BLOCK_SIZE = 512;
+static const int NR_OF_BLOCKS = 1;
+static const int BLOCK_SIZE = 32;
 const size_t Mb = 1<<20;
 
 // test macros
@@ -474,7 +474,9 @@ __device__ inttype FINDORPUT_WARP(inttype* t, inttype* d_q, inttype bi, inttype 
 }
 
 // find element, warp version. t is element stored in block cache
-__device__ inttype FIND_WARP(inttype* t, inttype* d_q, inttype bi, inttype bj, inttype bk, inttype bl, inttype bitmask, indextype hashtmp)	{
+__device__ inttype FIND_WARP(inttype* t, inttype* d_q)	{
+	inttype bi, bj, bk, bl, bitmask;
+	indextype hashtmp;
 	BucketEntryStatus threadstatus;
 	// prepare bitmask once to reason about results of threads in the same (state vector) group
 	bitmask = 0;
@@ -499,7 +501,7 @@ __device__ inttype FIND_WARP(inttype* t, inttype* d_q, inttype bi, inttype bj, i
 			}
 			return 1;
 		}
-		// try to find empty position to insert new state vector
+		// try to find empty position
 		threadstatus = (bl == EMPTYVECT32 && LANEPOINTSTOVALIDBUCKETPOS) ? EMPTY : TAKEN;
 		// let bk hold the smallest index of an available empty position
 		bk = __ffs(__ballot(threadstatus == EMPTY));
@@ -987,9 +989,18 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 											// ERROR! hash table too full. Set CONTINUE to 2
 											CONTINUE = 2;
 										}
-									} else if(local_action_counter != -1 && k == 0){
-										THREADBUFFERGROUPPOS(GROUP_ID,local_action_counter) = bi;
-										local_action_counter++;
+									} else if(local_action_counter != -1){
+										// Only keep unique pointers in the buffer
+										for(bk = bj = 0; bj < local_action_counter && bk == 0; bj++) {
+											if((THREADBUFFERGROUPPOS(GROUP_ID, local_action_counter) & 0x7FFFFFFF) == bi) {
+												bk = 1;
+											}
+										}
+										if(bk == 0) {
+											// Set the most-significant bit if we are not the owner
+											THREADBUFFERGROUPPOS(GROUP_ID,local_action_counter) = bi | (k << 31);
+											local_action_counter++;
+										}
 									}
 								}
 								else {
@@ -1039,14 +1050,28 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 			// they are new.
 			k = (d_shared_q_size-CACHEOFFSET)/d_sv_nints;
 			int por_possible = 0;
-			for (int32_t c = 0; c < local_action_counter + 1;) {
-				int active_lane = __ffs(__ballot(c < local_action_counter)) - 1;
-				if(active_lane == -1) {
+			int32_t index = -1;
+			int32_t c = 0;
+			while(1) {
+				if(__all(c >= local_action_counter)) {
 					break;
 				}
-				int cache_index = __shfl(active_lane == LANE ? THREADBUFFERGROUPPOS(GROUP_ID,c++) : 0, active_lane);
-				if(FIND_WARP((inttype*) &shared[CACHEOFFSET+cache_index], d_q, bi, bj, bk, bl, bitmask, hashtmp) == 0) {
+				if(c < local_action_counter) {
+					index = THREADBUFFERGROUPPOS(GROUP_ID,c);
+				}
+				int active_lane = __ffs(__ballot((index & 0x80000000) == 0)) - 1;
+
+				if(active_lane == -1) {
+					c++;
+					continue;
+				}
+				int cache_index = __shfl(index, active_lane);
+				if(FIND_WARP((inttype*) &shared[CACHEOFFSET+cache_index], d_q) == 0) {
 					por_possible |= active_lane == LANE;
+				}
+				if(active_lane == LANE || ((index & 0x80000000) != 0)) {
+					c++;
+					index = -1;
 				}
 			}
 			if(por_possible) {
@@ -1068,6 +1093,7 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 					}
 					THREADBUFFERGROUPPOS(GROUP_ID,c) = 0;
 				}
+				__syncthreads();
 				cont = 0;
 				offset1 = offset2;
 				if (THREADINGROUP && GROUP_ID == 0) {
@@ -1075,7 +1101,9 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 					THREADGROUPPOR = 0;
 				}
 			} else {
+				__syncthreads();
 				for(int32_t c = 0; c < local_action_counter; c++) {
+					SETNEWSTATE( &shared[CACHEOFFSET+THREADBUFFERGROUPPOS(GROUP_ID,c)] );
 					THREADBUFFERGROUPPOS(GROUP_ID,c) = 0;
 				}
 			}
