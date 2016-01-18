@@ -1,2 +1,5 @@
 /.ptp-sync/
 /Debug/
+.cproject
+.project
+.settings/
