@@ -941,10 +941,6 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		outtrans_enabled = 0;
 		local_action_counter = 0;
 		while (CONTINUE == 1) {
-//			if (src_state[0] == 33026) { // label 31!
-//				PRINTTHREAD(0,0);
-//			}
-		// for (loopcounter = 0; loopcounter < 10000 && CONTINUE == 1; loopcounter++) {
 			if (offset1 < offset2 || cont) {
 				if (!cont) {
 					// reset act
@@ -967,7 +963,6 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 							for (l = 1; l <= NR_OF_STATES_IN_TRANSENTRY(GROUP_ID); l++) {
 								GETPROCTRANSSTATE(pos, tmp, l, GROUP_ID);
 								if (pos > 0) {
-									//printf ("%d %d\n", l, pos);
 									SETSTATEVECTORSTATE(tgt_state, GROUP_ID, pos-1);
 									// check for violation of safety property, if required
 									if (d_property == SAFETY) {
@@ -1007,7 +1002,6 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 									break;
 								}
 							}
-							//printf ("out\n");
 							offset1++;
 						}
 						else {
@@ -1019,10 +1013,6 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 					i = 0;
 					if (offset1 < offset2) {
 						GETPROCTRANSACT(act, tmp);
-//						if (src_state[0] == 33026 && act == 31) { // label 31!
-//							PRINTTHREAD(GROUP_ID,TMPVAR);
-//						}
-						//PRINTTHREAD(0, act);
 						// store transition entry
 						THREADBUFFERGROUPPOS(GROUP_ID,i) = tmp;
 						cont = 1;
@@ -1144,9 +1134,6 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 						if (pos < (1 << d_bits_act)) {
 							THREADGROUPCOUNTER = pos;
 						}
-						//if (threadIdx.x == 0) {
-						//	printf ("counter value: %d\n", pos);
-						//}
 						// notify threads to work
 						for (i = 0; i < d_nr_procs; i++) {
 							l = THREADBUFFERGROUPPOS(i,0);
@@ -1161,7 +1148,6 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 					}
 				}
 			}
-			//if (0) {
 			__syncthreads();
 			// only active threads should do something
 			if (cont) {
@@ -1169,7 +1155,6 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 				// if the sync bit has been disabled, come into action, creating successors
 				GETPROCTRANSSYNC(index, THREADBUFFERGROUPPOS(GROUP_ID,0));
 				if (index == 0) {
-					//PRINTTHREAD(6, act);
 					// syncbits Offset position
 					i = act/(INTSIZE/d_nbits_syncbits_offset);
 					pos = act - (i*(INTSIZE/d_nbits_syncbits_offset));
@@ -1188,7 +1173,6 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 						index = tex1Dfetch(tex_syncbits, sync_offset1);
 						for (i = 0; i < (INTSIZE/d_nr_procs); i++) {
 							GETSYNCRULE(tmp, index, i);
-							//PRINTTHREAD(7, tmp);
 							if (tmp != 0) {
 								OWNSSYNCRULE(bitmask, tmp, GROUP_ID);
 							}
@@ -1206,26 +1190,14 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 									for (pos = 0; pos < d_sv_nints; pos++) {
 										tgt_state[pos] = src_state[pos];
 									}
-									//printf("src\n");
-									//PRINTVECTOR(src_state);
-									//printf("%d\n", src_state[0]);
-									//printf("%d\n", act);
 									// construct first successor
 									for (pos = 0; pos < d_nr_procs; pos++) {
 										if (GETBIT(pos, tmp)) {
 											// get first state
 											GETPROCTRANSSTATE(k, THREADBUFFERGROUPPOS(pos,0), 1, pos);
-											//PRINTTHREAD(1, THREADBUFFERGROUPPOS(pos,0));
-											//PRINTTHREAD(2, k);
 											SETSTATEVECTORSTATE(tgt_state, pos, k-1);
-//											if (src_state[0] == 33026 && act == 31) { // label 31!
-//												PRINTTHREAD(pos,k-1);
-//											}
 										}
 									}
-									//PRINTVECTOR(tgt_state);
-									//STRIPSTATE(tgt_state);
-									//PRINTTHREAD(3, tgt_state[0]);
 									SETNEWSTATE(tgt_state);
 									// while we keep getting new states, store them
 									while (ISNEWSTATE(tgt_state)) {
@@ -1240,30 +1212,14 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 
 										// store tgt_state in cache; if i == d_shared_q_size, state was found, duplicate detected
 										// if i == d_shared_q_size+1, cache is full, immediately store in global hash table
-										//printf ("store in cache\n");
-										//PRINTTHREAD(0, 10);
-										//PRINTTHREAD(0, 11);
-										// state stored: search for it in global hash table
-										//if (pos < d_shared_q_size) {
-										//	LOOKUPINCLOSED(k, tgt_state);
-										//	// state found, set old in shared cache
-										//	if (k < q_size) {
-										//		printf ("already in hash table\n");
-										//		SETOLDSTATE(&shared[CACHEOFFSET+pos]);
-										//	}
-										//}
-										// cache time-out; store directly in global hash table
 										TMPVAR = STOREINCACHE(tgt_state, d_q, &bitmask);
 										if (TMPVAR == 2) {
+											// cache time-out; store directly in global hash table
 											if (FINDORPUT_SINGLE(tgt_state, d_q, bi, bj, bk, bl, hashtmp) == 0) {
 												// ERROR! hash table too full. Set CONTINUE to 2
 												CONTINUE = 2;
 											}
 										}
-//										if (tgt_state[0] == 196866) { // src_state[0] == 33026, label 31! 196866
-//											PRINTTHREAD(555,TMPVAR);
-//											PRINTTHREAD(777,shared[CACHEOFFSET+TMPVAR]);
-//										}
 										// get next successor
 										for (pos = d_nr_procs-1; pos > (int) GROUP_ID-1; pos--) {
 											if (GETBIT(pos,tmp)) {
