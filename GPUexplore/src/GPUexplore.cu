@@ -93,7 +93,7 @@ static const int SH_OFFSET = 3;
 //static const int BLOCK_SIZE = 512;
 static const int KERNEL_ITERS = 1;
 static const int NR_OF_BLOCKS = 1;
-static const int BLOCK_SIZE = 32;
+static const int BLOCK_SIZE = 256;
 const size_t Mb = 1<<20;
 
 // test macros
@@ -992,7 +992,7 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 									} else if(local_action_counter != -1){
 										// Only keep unique pointers in the buffer
 										for(bk = bj = 0; bj < local_action_counter && bk == 0; bj++) {
-											if((THREADBUFFERGROUPPOS(GROUP_ID, local_action_counter) & 0x7FFFFFFF) == bi) {
+											if((THREADBUFFERGROUPPOS(GROUP_ID, bj) & 0x7FFFFFFF) == bi) {
 												bk = 1;
 											}
 										}
@@ -1085,7 +1085,9 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 			// new states from one thread as new.
 			// Reset some variables to prevent further successor
 			// generation.
-			if(THREADGROUPPOR < (0x80000000 | d_nr_procs) && THREADGROUPPOR != 0) {
+			int do_por = THREADGROUPPOR < (0x80000000 | d_nr_procs) && THREADGROUPPOR != 0;
+			__syncthreads();
+			if(do_por) {
 				// Cycle proviso is satisfied
 				for(int32_t c = 0; c < local_action_counter; c++) {
 					if((THREADGROUPPOR & 0x7FFFFFFF) != GROUP_ID) {
@@ -1093,15 +1095,15 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 					}
 					THREADBUFFERGROUPPOS(GROUP_ID,c) = 0;
 				}
-				__syncthreads();
 				cont = 0;
 				offset1 = offset2;
 				if (THREADINGROUP && GROUP_ID == 0) {
 					THREADGROUPCOUNTER = EXPLORATION_DONE;
 					THREADGROUPPOR = 0;
 				}
-			} else {
-				__syncthreads();
+			}
+			__syncthreads();
+			if(do_por == 0){
 				for(int32_t c = 0; c < local_action_counter; c++) {
 					SETNEWSTATE( &shared[CACHEOFFSET+THREADBUFFERGROUPPOS(GROUP_ID,c)] );
 					THREADBUFFERGROUPPOS(GROUP_ID,c) = 0;
@@ -1359,28 +1361,9 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 				}
 			}
 		}
-		//if (loopcounter == 10000 && CONTINUE == 1) {
-		//	PRINTTHREAD(0,offset1)
-		//	PRINTTHREAD(1,offset2)
-		//	PRINTTHREAD(2,cont)
-		//}
-		//if (THREADINGROUP) {
-		//	if (offset1 < offset2) {
-		//		PRINTTHREAD(0,offset1)
-		//		PRINTTHREAD(1,offset2)
-		//		PRINTTHREAD(3,GROUP_ID)
-		//		PRINTVECTOR(src_state)
-		//	}
-		//	if (cont) {
-		//		PRINTTHREAD(2,cont)
-		//	}
-		//}
 		// start scanning the local cache and write results to the global hash table
 		k = (d_shared_q_size-CACHEOFFSET)/d_sv_nints;
 		for (i = WARP_ID; i < k; i += (blockDim.x/WARPSIZE)) {
-//			if (shared[CACHEOFFSET+(i*d_sv_nints)] == 196866) { // src_state[0] == 33026, label 31!
-//				PRINTTHREAD(5,5);
-//			}
 			if (ISNEWSTATE(&shared[CACHEOFFSET+(i*d_sv_nints)])) {
 				// look for the state in the global hash table
 				if (FINDORPUT_WARP((inttype*) &shared[CACHEOFFSET+(i*d_sv_nints)], d_q, bi, bj, bk, bl, bitmask, hashtmp) == 0) {
