@@ -93,7 +93,7 @@ static const int SH_OFFSET = 3;
 //static const int BLOCK_SIZE = 512;
 static const int KERNEL_ITERS = 1;
 static const int NR_OF_BLOCKS = 1;
-static const int BLOCK_SIZE = 256;
+static const int BLOCK_SIZE = 32;
 const size_t Mb = 1<<20;
 
 // test macros
@@ -274,6 +274,46 @@ __device__ inttype STOREINCACHE(inttype* t, inttype* d_q, inttype* address) {
 		}
 	}
 	return 2;
+}
+
+// Return 0 if not found, 1 if found in Open, 2 if found in Closed
+__device__ inttype FINDINCACHE(inttype* t, inttype* d_q, inttype* address) {
+	inttype bi, bj, bl, bitmask;
+	indextype hashtmp;
+	STRIPSTATE(t);
+	hashtmp = 0;
+	for (bi = 0; bi < d_sv_nints; bi++) {
+		hashtmp += t[bi];
+	}
+	bitmask = d_sv_nints*((inttype) (hashtmp % ((d_shared_q_size - CACHEOFFSET) / d_sv_nints)));
+	SETNEWSTATE(t);
+	bl = 0;
+	while (bl < CACHERETRYFREQ) {
+		bi = shared[CACHEOFFSET+bitmask+(d_sv_nints-1)];
+		if (COMPAREENTRIES(bi, t[d_sv_nints-1])) {
+			if (d_sv_nints == 1) {
+				*address = bitmask;
+				return 2 - ISNEWINT(bi);
+			}
+			else {
+				for (bj = 0; bj < d_sv_nints-1; bj++) {
+					if (shared[CACHEOFFSET+bitmask+bj] != (t)[bj]) {
+						break;
+					}
+				}
+				if (bj == d_sv_nints-1) {
+					*address = bitmask;
+					return 2 - ISNEWINT(bj);
+				}
+			}
+		}
+		bl++;
+		bitmask += d_sv_nints;
+		if ((bitmask+(d_sv_nints-1)) >= (d_shared_q_size - CACHEOFFSET)) {
+			bitmask = 0;
+		}
+	}
+	return 0;
 }
 
 // hash functions use bj variable
@@ -496,7 +536,7 @@ __device__ inttype FIND_WARP(inttype* t, inttype* d_q)	{
 		}
 		if (__ballot(threadstatus == FOUND) != 0) {
 			// state vector has been found in bucket. mark local copy as old.
-			if (threadstatus == FOUND && ENTRY_ID == 0) {
+			if (threadstatus == FOUND && ENTRY_ID == d_sv_nints - 1 && ISNEWINT(bk) == 0) {
 				SETOLDSTATE(t);
 			}
 			return 1;
@@ -803,7 +843,6 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 	//inttype global_id = (blockIdx.x * blockDim.x) + threadIdx.x;
 	//inttype group_nr = threadIdx.x / nr_procs;
 	inttype i, k, l, index, offset1, offset2, tmp, cont, act, sync_offset1, sync_offset2;
-	int32_t local_action_counter;
 	inttype src_state[MAX_SIZE], tgt_state[MAX_SIZE];
 	inttype bitmask, bi, bj, bk, bl;
 	indextype hashtmp;
@@ -939,7 +978,11 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		// while there is work to be done
 		//int loopcounter = 0;
 		outtrans_enabled = 0;
-		local_action_counter = 0;
+		int generate = 2;
+		int proviso_satisfied = 0;
+		int cluster_trans = 1 << GROUP_ID;
+		int orig_offset1 = offset1;
+		while(generate > -1) {
 		while (CONTINUE == 1) {
 			if (offset1 < offset2 || cont) {
 				if (!cont) {
@@ -977,24 +1020,26 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 									}
 									// store tgt_state in cache; if i == d_shared_q_size, state was found, duplicate detected
 									// if i == d_shared_q_size+1, cache is full, immediately store in global hash table
-									k = STOREINCACHE(tgt_state, d_q, &bi);
-									if (k == 2) {
-										// cache time-out; store directly in global hash table
-										if (FINDORPUT_SINGLE(tgt_state, d_q, bi, bj, bk, bl, hashtmp) == 0) {
-											// ERROR! hash table too full. Set CONTINUE to 2
-											CONTINUE = 2;
-										}
-									} else if(local_action_counter != -1){
-										// Only keep unique pointers in the buffer
-										for(bk = bj = 0; bj < local_action_counter && bk == 0; bj++) {
-											if((THREADBUFFERGROUPPOS(GROUP_ID, bj) & 0x7FFFFFFF) == bi) {
-												bk = 1;
+									if(generate == 2) {
+										k = STOREINCACHE(tgt_state, d_q, &bi);
+										if (k == 2) {
+											// cache time-out; store directly in global hash table
+											if (FINDORPUT_SINGLE(tgt_state, d_q, bi, bj, bk, bl, hashtmp) == 0) {
+												// ERROR! hash table too full. Set CONTINUE to 2
+												CONTINUE = 2;
 											}
 										}
-										if(bk == 0) {
-											// Set the most-significant bit if we are not the owner
-											THREADBUFFERGROUPPOS(GROUP_ID,local_action_counter) = bi | (k << 31);
-											local_action_counter++;
+									} else if(generate == 1) {
+										k = FINDINCACHE(tgt_state, d_q, &bi);
+										if(k == 1) {
+											proviso_satisfied = 1;
+											offset1 = offset2;
+											break;
+										}
+									} else {
+										if(GETBIT(GROUP_ID, THREADGROUPPOR) == 0) {
+											FINDINCACHE(tgt_state, d_q, &bi);
+											SETOLDSTATE(&shared[CACHEOFFSET + bi]);
 										}
 									}
 								}
@@ -1031,75 +1076,10 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 							}
 						}
 					} else {
-						THREADGROUPPOR = 0x80000000 | d_nr_procs;
+						//THREADGROUPPOR = 0x80000000 | d_nr_procs;
 					}
 				}
 			}
-			// All states following from local transitions
-			// are now checked in global memory to see if
-			// they are new.
-			k = (d_shared_q_size-CACHEOFFSET)/d_sv_nints;
-			int por_possible = 0;
-			int32_t index = -1;
-			int32_t c = 0;
-			while(1) {
-				if(__all(c >= local_action_counter)) {
-					break;
-				}
-				if(c < local_action_counter) {
-					index = THREADBUFFERGROUPPOS(GROUP_ID,c);
-				}
-				int active_lane = __ffs(__ballot((index & 0x80000000) == 0)) - 1;
-
-				if(active_lane == -1) {
-					c++;
-					continue;
-				}
-				int cache_index = __shfl(index, active_lane);
-				if(FIND_WARP((inttype*) &shared[CACHEOFFSET+cache_index], d_q) == 0) {
-					por_possible |= active_lane == LANE;
-				}
-				if(active_lane == LANE || ((index & 0x80000000) != 0)) {
-					c++;
-					index = -1;
-				}
-			}
-			if(por_possible) {
-				// At least one state following from a local
-				// transition is new, report that POR
-				// can be applied.
-				atomicMin((int*)&THREADGROUPPOR, 0x80000000 | GROUP_ID);
-			}
-			__syncthreads();
-			// Apply partial-order reduction by only retaining
-			// new states from one thread as new.
-			// Reset some variables to prevent further successor
-			// generation.
-			int do_por = THREADGROUPPOR < (0x80000000 | d_nr_procs) && THREADGROUPPOR != 0;
-			__syncthreads();
-			if(do_por) {
-				// Cycle proviso is satisfied
-				for(int32_t c = 0; c < local_action_counter; c++) {
-					if((THREADGROUPPOR & 0x7FFFFFFF) != GROUP_ID) {
-						SETOLDSTATE( &shared[CACHEOFFSET+THREADBUFFERGROUPPOS(GROUP_ID,c)] );
-					}
-					THREADBUFFERGROUPPOS(GROUP_ID,c) = 0;
-				}
-				cont = 0;
-				offset1 = offset2;
-				if (THREADINGROUP && GROUP_ID == 0) {
-					THREADGROUPCOUNTER = EXPLORATION_DONE;
-					THREADGROUPPOR = 0;
-				}
-			}
-			__syncthreads();
-			if(do_por == 0){
-				for(int32_t c = 0; c < local_action_counter; c++) {
-					SETNEWSTATE( &shared[CACHEOFFSET+THREADBUFFERGROUPPOS(GROUP_ID,c)] );
-					THREADBUFFERGROUPPOS(GROUP_ID,c) = 0;
-				}
-			}
-			local_action_counter = -1;
 			// group leaders now need to set the counter to the next minimal action value.
 			// To avoid bank conflicts afterwards when threads would need to read GETTHREADGROUPCOUNTER,
 			// the leader disables the SYNC bit of transition entries for those threads which need
@@ -1179,10 +1159,11 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 							else {
 								bitmask = 0;
 							}
-							if (bitmask) {
+							if (bitmask || (generate == 1 && GETBIT(GROUP_ID, tmp))) {
 								// start combining entries in the buffer to create target states
 								// if sync rule applicable, construct the first successor
 								// copy src_state into tgt_state
+								cluster_trans |= tmp;
 								SYNCRULEISAPPLICABLE(l, tmp, act);
 								if (l) {
 									// source state is not a deadlock
@@ -1212,27 +1193,43 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 
 										// store tgt_state in cache; if i == d_shared_q_size, state was found, duplicate detected
 										// if i == d_shared_q_size+1, cache is full, immediately store in global hash table
-										TMPVAR = STOREINCACHE(tgt_state, d_q, &bitmask);
-										if (TMPVAR == 2) {
-											// cache time-out; store directly in global hash table
-											if (FINDORPUT_SINGLE(tgt_state, d_q, bi, bj, bk, bl, hashtmp) == 0) {
-												// ERROR! hash table too full. Set CONTINUE to 2
-												CONTINUE = 2;
+										if(generate == 2) {
+											TMPVAR = STOREINCACHE(tgt_state, d_q, &bitmask);
+											if (TMPVAR == 2) {
+												// cache time-out; store directly in global hash table
+												if (FINDORPUT_SINGLE(tgt_state, d_q, bi, bj, bk, bl, hashtmp) == 0) {
+													// ERROR! hash table too full. Set CONTINUE to 2
+													CONTINUE = 2;
+												}
+											}
+										} else if(generate == 1) {
+											TMPVAR = FINDINCACHE(tgt_state, d_q, &bitmask);
+											if(TMPVAR == 1) {
+												proviso_satisfied = 1;
+												sync_offset1 = sync_offset2;
+												i = INTSIZE/d_nr_procs;
+												break;
+											}
+										} else {
+											if(GETBIT(GROUP_ID, THREADGROUPPOR) == 0) {
+												FINDINCACHE(tgt_state, d_q, &TMPVAR);
+												SETOLDSTATE(&shared[CACHEOFFSET + TMPVAR]);
+												printf("cluster %d, Marking state %d as old, groupid = %d\n",THREADGROUPPOR,shared[CACHEOFFSET + TMPVAR], GROUP_ID);
 											}
 										}
 										// get next successor
-										for (pos = d_nr_procs-1; pos > (int) GROUP_ID-1; pos--) {
+										for (pos = d_nr_procs-1; pos > - 1; pos--) {
 											if (GETBIT(pos,tmp)) {
 												GETSTATEVECTORSTATE(cont, tgt_state, pos);
-												act = 0;
+												int st = 0;
 												for (k = 0; k < d_max_buf_ints; k++) {
 													for (l = 1; l <= NR_OF_STATES_IN_TRANSENTRY(pos); l++) {
-														GETPROCTRANSSTATE(act, THREADBUFFERGROUPPOS(pos,k), l, pos);
-														if (cont == (act-1)) {
+														GETPROCTRANSSTATE(st, THREADBUFFERGROUPPOS(pos,k), l, pos);
+														if (cont == (st-1)) {
 															break;
 														}
 													}
-													if (cont == (act-1)) {
+													if (cont == (st-1)) {
 														break;
 													}
 												}
@@ -1240,7 +1237,7 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 												// Try to get the next element
 												if (l == NR_OF_STATES_IN_TRANSENTRY(pos)) {
 													if (k >= d_max_buf_ints-1) {
-														act = 0;
+														st = 0;
 													}
 													else {
 														k++;
@@ -1251,21 +1248,21 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 													l++;
 												}
 												// Retrieve next element, insert it in 'tgt_state' if it is not 0, and return result, otherwise continue
-												if (act != 0) {
-													GETPROCTRANSSTATE(act, THREADBUFFERGROUPPOS(pos,k), l, pos);
-													if (act > 0) {
-														SETSTATEVECTORSTATE(tgt_state, pos, act-1);
+												if (st != 0) {
+													GETPROCTRANSSTATE(st, THREADBUFFERGROUPPOS(pos,k), l, pos);
+													if (st > 0) {
+														SETSTATEVECTORSTATE(tgt_state, pos, st-1);
 														SETNEWSTATE(tgt_state);
 														break;
 													}
 												}
 												// else, set this process state to first one, and continue to next process
-												GETPROCTRANSSTATE(act, THREADBUFFERGROUPPOS(pos,0), 1, pos);
-												SETSTATEVECTORSTATE(tgt_state, pos, act-1);
+												GETPROCTRANSSTATE(st, THREADBUFFERGROUPPOS(pos,0), 1, pos);
+												SETSTATEVECTORSTATE(tgt_state, pos, st-1);
 											}
 										}
 										// did we find a successor? if not, set tgt_state to old
-										if (pos == (int) GROUP_ID-1) {
+										if (pos == -1) {
 											SETOLDSTATE(tgt_state);
 										}
 									}
@@ -1297,6 +1294,60 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 //			}
 			__syncthreads();
 		} // END WHILE CONTINUE == 1
+
+		if(generate == 2) {
+			// update the local cache based on global memory
+			k = (d_shared_q_size-CACHEOFFSET)/d_sv_nints;
+			for (i = WARP_ID; i < k; i += (blockDim.x/WARPSIZE)) {
+				if (ISNEWSTATE(&shared[CACHEOFFSET+(i*d_sv_nints)])) {
+					FIND_WARP((inttype*) &shared[CACHEOFFSET+(i*d_sv_nints)], d_q);
+				}
+			}
+			__syncthreads();
+		} else if(generate == 1 && THREADINGROUP) {
+			// Choose a cluster for reduction
+			THREADBUFFERGROUPPOS(GROUP_ID,0) = proviso_satisfied ? cluster_trans : cluster_trans & ~(1 << GROUP_ID);
+			__syncthreads();
+			int apply_por = 1;
+			proviso_satisfied = 0;
+			for(i = 0; i < d_nr_procs && apply_por; i++) {
+				if(GETBIT(i, cluster_trans)) {
+					// This process synchronizes with this process i
+					if((cluster_trans | THREADBUFFERGROUPPOS(i,0)) == cluster_trans) {
+						// Process i's actions do not go outside our cluster
+						// Keep the POR dream alive
+						proviso_satisfied |= (THREADBUFFERGROUPPOS(i,0) >> i) & 1;
+					} else {
+						// Reduction cannot be applied based on the cluster of this thread
+						apply_por = 0;
+					}
+				}
+			}
+			__syncthreads();
+			if(!(apply_por && proviso_satisfied)) {
+				THREADBUFFERGROUPPOS(GROUP_ID,0) = 0;
+			}
+			__syncthreads();
+			if(GROUP_ID == 0) {
+				int min = d_nr_procs;
+				int cluster = 0xFFFFFFFF >> (INTSIZE - d_nr_procs);
+				for(i = 0; i < d_nr_procs; i++) {
+//					PRINTTHREAD(2, THREADBUFFERGROUPPOS(i,0));
+					if(THREADBUFFERGROUPPOS(i,0) > 0 && __popc(THREADBUFFERGROUPPOS(i,0)) < min) {
+						min = __popc(THREADBUFFERGROUPPOS(i,0));
+						cluster = THREADBUFFERGROUPPOS(i,0);
+					}
+				}
+				THREADGROUPPOR = cluster;
+				printf("Selected cluster %d for POR\n",cluster);
+			}
+			__syncthreads();
+		}
+		offset1 = orig_offset1;
+		THREADGROUPCOUNTER = (1 << d_bits_act);
+		CONTINUE = 1;
+		generate--;
+		}
 		// have we encountered a deadlock state?
 		// we use the shared memory to communicate this to the group leaders
 		if (d_property == DEADLOCK) {
