@@ -1339,7 +1339,9 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 					}
 				}
 				THREADGROUPPOR = cluster;
-				printf("Selected cluster %d for POR\n",cluster);
+				if(cluster < (0xFFFFFFFF >> (INTSIZE - d_nr_procs))) {
+					printf("Selected cluster %d for POR\n",cluster);
+				}
 			}
 			__syncthreads();
 		}
