@@ -93,7 +93,7 @@ static const int SH_OFFSET = 3;
 //static const int BLOCK_SIZE = 512;
 static const int KERNEL_ITERS = 1;
 static const int NR_OF_BLOCKS = 1;
-static const int BLOCK_SIZE = 256;
+static const int BLOCK_SIZE = 32;
 const size_t Mb = 1<<20;
 
 // test macros
@@ -496,10 +496,10 @@ __device__ inttype FIND_WARP(inttype* t, inttype* d_q)	{
 		}
 		if (__ballot(threadstatus == FOUND) != 0) {
 			// state vector has been found in bucket. mark local copy as old.
-			if (threadstatus == FOUND && ENTRY_ID == 0) {
+			if (threadstatus == FOUND && ENTRY_ID == d_sv_nints - 1 && ISNEWINT(bl) == 0) {
 				SETOLDSTATE(t);
 			}
-			return 1;
+			return __any(threadstatus == FOUND && ENTRY_ID == d_sv_nints - 1 && ISNEWINT(bl) == 0) != 0;
 		}
 		// try to find empty position
 		threadstatus = (bl == EMPTYVECT32 && LANEPOINTSTOVALIDBUCKETPOS) ? EMPTY : TAKEN;
@@ -1068,7 +1068,7 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 				// At least one state following from a local
 				// transition is new, report that POR
 				// can be applied.
-				atomicMin((int*)&THREADGROUPPOR, 0x80000000 | GROUP_ID);
+				atomicMin((unsigned int*)&THREADGROUPPOR, 0x80000000 | GROUP_ID);
 			}
 			__syncthreads();
 			// Apply partial-order reduction by only retaining
@@ -1081,7 +1081,7 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 				// Cycle proviso is satisfied
 				for(int32_t c = 0; c < local_action_counter; c++) {
 					if((THREADGROUPPOR & 0x7FFFFFFF) != GROUP_ID) {
-						SETOLDSTATE( &shared[CACHEOFFSET+THREADBUFFERGROUPPOS(GROUP_ID,c)] );
+						SETOLDSTATE( &shared[CACHEOFFSET+ (THREADBUFFERGROUPPOS(GROUP_ID,c) & 0x7FFFFFFF)] );
 					}
 					THREADBUFFERGROUPPOS(GROUP_ID,c) = 0;
 				}
