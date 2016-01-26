@@ -1378,12 +1378,16 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		}
 		// start scanning the local cache and write results to the global hash table
 		k = (d_shared_q_size-CACHEOFFSET)/d_sv_nints;
-		for (i = WARP_ID; i < k; i += (blockDim.x/WARPSIZE)) {
-			if (ISNEWSTATE(&shared[CACHEOFFSET+(i*d_sv_nints)])) {
-				// look for the state in the global hash table
-				if (FINDORPUT_WARP((inttype*) &shared[CACHEOFFSET+(i*d_sv_nints)], d_q, bi, bj, bk, bl, bitmask, hashtmp) == 0) {
-					// ERROR: hash table is full
+		int c;
+		for (i = WARP_ID; i * WARPSIZE < k; i += (blockDim.x / WARPSIZE)) {
+			int have_new_state = i * WARPSIZE + LANE < k && ISNEWSTATE(&shared[CACHEOFFSET+(i*WARPSIZE+LANE)*d_sv_nints]);
+			while (c = __ballot(have_new_state)) {
+				int active_lane = __ffs(c) - 1;
+				if(FINDORPUT_WARP((inttype*) &shared[CACHEOFFSET + (i*WARPSIZE+active_lane)*d_sv_nints], d_q, bi, bj, bk, bl, bitmask, hashtmp) == 0) {
 					CONTINUE = 2;
+				}
+				if (LANE == active_lane) {
+					have_new_state = 0;
 				}
 			}
 		}
