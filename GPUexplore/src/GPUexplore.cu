@@ -1224,15 +1224,15 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 										for (pos = d_nr_procs-1; pos > (int) GROUP_ID-1; pos--) {
 											if (GETBIT(pos,tmp)) {
 												GETSTATEVECTORSTATE(cont, tgt_state, pos);
-												act = 0;
+												int st = 0;
 												for (k = 0; k < d_max_buf_ints; k++) {
 													for (l = 1; l <= NR_OF_STATES_IN_TRANSENTRY(pos); l++) {
-														GETPROCTRANSSTATE(act, THREADBUFFERGROUPPOS(pos,k), l, pos);
-														if (cont == (act-1)) {
+														GETPROCTRANSSTATE(st, THREADBUFFERGROUPPOS(pos,k), l, pos);
+														if (cont == (st-1)) {
 															break;
 														}
 													}
-													if (cont == (act-1)) {
+													if (cont == (st-1)) {
 														break;
 													}
 												}
@@ -1240,7 +1240,7 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 												// Try to get the next element
 												if (l == NR_OF_STATES_IN_TRANSENTRY(pos)) {
 													if (k >= d_max_buf_ints-1) {
-														act = 0;
+														st = 0;
 													}
 													else {
 														k++;
@@ -1251,17 +1251,17 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 													l++;
 												}
 												// Retrieve next element, insert it in 'tgt_state' if it is not 0, and return result, otherwise continue
-												if (act != 0) {
-													GETPROCTRANSSTATE(act, THREADBUFFERGROUPPOS(pos,k), l, pos);
-													if (act > 0) {
-														SETSTATEVECTORSTATE(tgt_state, pos, act-1);
+												if (st != 0) {
+													GETPROCTRANSSTATE(st, THREADBUFFERGROUPPOS(pos,k), l, pos);
+													if (st > 0) {
+														SETSTATEVECTORSTATE(tgt_state, pos, st-1);
 														SETNEWSTATE(tgt_state);
 														break;
 													}
 												}
 												// else, set this process state to first one, and continue to next process
-												GETPROCTRANSSTATE(act, THREADBUFFERGROUPPOS(pos,0), 1, pos);
-												SETSTATEVECTORSTATE(tgt_state, pos, act-1);
+												GETPROCTRANSSTATE(st, THREADBUFFERGROUPPOS(pos,0), 1, pos);
+												SETSTATEVECTORSTATE(tgt_state, pos, st-1);
 											}
 										}
 										// did we find a successor? if not, set tgt_state to old
