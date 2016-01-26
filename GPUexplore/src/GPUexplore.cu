@@ -1298,9 +1298,15 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		if(generate == 2) {
 			// update the local cache based on global memory
 			k = (d_shared_q_size-CACHEOFFSET)/d_sv_nints;
-			for (i = WARP_ID; i < k; i += (blockDim.x/WARPSIZE)) {
-				if (ISNEWSTATE(&shared[CACHEOFFSET+(i*d_sv_nints)])) {
-					FIND_WARP((inttype*) &shared[CACHEOFFSET+(i*d_sv_nints)], d_q);
+			int c;
+			for (i = WARP_ID; i*32 < k; i += (blockDim.x/WARPSIZE)) {
+				int have_new_state = i * 32 + LANE < k && ISNEWSTATE(&shared[CACHEOFFSET+(i*d_sv_nints)]);
+				while(c = __ballot(have_new_state)) {
+					int active_lane = __ffs(c) - 1;
+					FIND_WARP((inttype*) &shared[CACHEOFFSET+(i*32*d_sv_nints)+active_lane], d_q);
+					if(LANE == active_lane) {
+						have_new_state = 0;
+					}
 				}
 			}
 			__syncthreads();
