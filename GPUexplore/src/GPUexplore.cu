@@ -496,10 +496,10 @@ __device__ inttype FIND_WARP(inttype* t, inttype* d_q)	{
 		}
 		if (__ballot(threadstatus == FOUND) != 0) {
 			// state vector has been found in bucket. mark local copy as old.
-			if (threadstatus == FOUND && ENTRY_ID == d_sv_nints - 1 && ISNEWINT(bl) == 0) {
+			if (threadstatus == FOUND & ISNEWINT(bl) == 0 & ENTRY_ID == d_sv_nints - 1) {
 				SETOLDSTATE(t);
 			}
-			return __any(threadstatus == FOUND && ENTRY_ID == d_sv_nints - 1 && ISNEWINT(bl) == 0) != 0;
+			return __ballot(threadstatus == FOUND & ISNEWINT(bl) == 0 & ENTRY_ID == d_sv_nints - 1);
 		}
 		// try to find empty position
 		threadstatus = (bl == EMPTYVECT32 && LANEPOINTSTOVALIDBUCKETPOS) ? EMPTY : TAKEN;
@@ -1064,6 +1064,7 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 					index = -1;
 				}
 			}
+			__syncthreads();
 			if(por_possible) {
 				// At least one state following from a local
 				// transition is new, report that POR
