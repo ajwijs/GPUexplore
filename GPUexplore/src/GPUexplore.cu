@@ -1095,7 +1095,7 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 			__syncthreads();
 			if(do_por == 0){
 				for(int32_t c = 0; c < local_action_counter; c++) {
-					SETNEWSTATE( &shared[CACHEOFFSET+THREADBUFFERGROUPPOS(GROUP_ID,c)] );
+					SETNEWSTATE( &shared[CACHEOFFSET+ (THREADBUFFERGROUPPOS(GROUP_ID,c) & 0x7FFFFFFF)] );
 					THREADBUFFERGROUPPOS(GROUP_ID,c) = 0;
 				}
 			}
