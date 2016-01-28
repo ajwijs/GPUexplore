@@ -1212,7 +1212,7 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 											if(GETBIT(GROUP_ID, THREADGROUPPOR) == 0) {
 												FINDINCACHE(tgt_state, d_q, &TMPVAR);
 												SETOLDSTATE(&shared[CACHEOFFSET + TMPVAR]);
-												printf("cluster %d, Marking state %d as old, groupid = %d\n",THREADGROUPPOR,shared[CACHEOFFSET + TMPVAR], GROUP_ID);
+//												printf("cluster %d, Marking state %d as old, groupid = %d\n",THREADGROUPPOR,shared[CACHEOFFSET + TMPVAR], GROUP_ID);
 											}
 										}
 										// get next successor
@@ -1344,7 +1344,7 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 				}
 				THREADGROUPPOR = cluster;
 				if(cluster < (0xFFFFFFFF >> (INTSIZE - d_nr_procs))) {
-					printf("Selected cluster %d for POR\n",cluster);
+//					printf("Selected cluster %d for POR\n",cluster);
 				}
 			}
 			__syncthreads();
