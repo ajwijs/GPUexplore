@@ -303,7 +303,7 @@ __device__ inttype FINDINCACHE(inttype* t, inttype* d_q, inttype* address) {
 				}
 				if (bj == d_sv_nints-1) {
 					*address = bitmask;
-					return 2 - ISNEWINT(bj);
+					return 2 - ISNEWINT(bi);
 				}
 			}
 		}
@@ -1075,8 +1075,6 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 								break;
 							}
 						}
-					} else {
-						//THREADGROUPPOR = 0x80000000 | d_nr_procs;
 					}
 				}
 			}
@@ -1204,7 +1202,7 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 											}
 										} else if(generate == 1) {
 											TMPVAR = FINDINCACHE(tgt_state, d_q, &bitmask);
-											if(TMPVAR == 1) {
+											if(TMPVAR != 2) {
 												proviso_satisfied = 1;
 												sync_offset1 = sync_offset2;
 												i = INTSIZE/d_nr_procs;
@@ -1352,7 +1350,9 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 			__syncthreads();
 		}
 		offset1 = orig_offset1;
-		THREADGROUPCOUNTER = (1 << d_bits_act);
+		if(THREADINGROUP) {
+			THREADGROUPCOUNTER = (1 << d_bits_act);
+		}
 		CONTINUE = 1;
 		generate--;
 		}
