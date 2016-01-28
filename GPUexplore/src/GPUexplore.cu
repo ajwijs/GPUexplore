@@ -1076,7 +1076,10 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 			// new states from one thread as new.
 			// Reset some variables to prevent further successor
 			// generation.
-			int do_por = THREADGROUPPOR < (0x80000000 | d_nr_procs) && THREADGROUPPOR != 0;
+			int do_por = 0;
+			if(THREADINGROUP) {
+				do_por = THREADGROUPPOR < (0x80000000 | d_nr_procs) && THREADGROUPPOR != 0;
+			}
 			__syncthreads();
 			if(do_por) {
 				// Cycle proviso is satisfied
