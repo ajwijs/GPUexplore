@@ -653,7 +653,7 @@ void print_statevector(FILE* stream, inttype *state, inttype *firstbit_statevect
 			fprintf (stream, ",");
 		}
 	}
-	fprintf (stdout, " ");
+	fprintf (stream, " ");
 	for (i = 0; i < sv_nints; i++) {
 		fprintf (stream, "%d ", STRIPPEDENTRY_HOST(state[i], i));
 	}
@@ -705,7 +705,7 @@ void print_local_queue(FILE* stream, inttype *q, inttype q_size, inttype *firstb
 			}
 		}
 	}
-	fprintf (stdout, "nr. of states in hash table: %d (%d unexplored states)\n", count, newcount);
+	fprintf (stream, "nr. of states in hash table: %d (%d unexplored states)\n", count, newcount);
 }
 
 //test function to count the contents of the device queue
