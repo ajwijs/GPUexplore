@@ -332,7 +332,9 @@ __device__ inttype LANE_POINTS_TO_EL(inttype i)	{
 //#define STARTPOS_OF_EL_IN_BUCKET_HOST(i)	(i*sv_nints)
 
 // find or put element, single thread version.
-__device__ inttype FINDORPUT_SINGLE(inttype* t, inttype* d_q, inttype bi, inttype bj, inttype bk, inttype bl, indextype hashtmp) {
+__device__ inttype FINDORPUT_SINGLE(inttype* t, inttype* d_q) {
+	inttype bi, bj, bk, bl;
+	indextype hashtmp;
 	for (bi = 0; bi < NR_HASH_FUNCTIONS; bi++) {
 		HASHFUNCTION(hashtmp, bi, t);
 		for (bj = 0; bj < NREL_IN_BUCKET; bj++) {
@@ -372,7 +374,9 @@ __device__ inttype FINDORPUT_SINGLE(inttype* t, inttype* d_q, inttype bi, inttyp
 }
 
 // find or put element, warp version. t is element stored in block cache
-__device__ inttype FINDORPUT_WARP(inttype* t, inttype* d_q, inttype bi, inttype bj, inttype bk, inttype bl, inttype bitmask, indextype hashtmp)	{
+__device__ inttype FINDORPUT_WARP(inttype* t, inttype* d_q)	{
+	inttype bi, bj, bk, bl, bitmask;
+	indextype hashtmp;
 	BucketEntryStatus threadstatus;
 	// prepare bitmask once to reason about results of threads in the same (state vector) group
 	bitmask = 0;
@@ -980,7 +984,7 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 									k = STOREINCACHE(tgt_state, d_q, &bi);
 									if (k == 2) {
 										// cache time-out; store directly in global hash table
-										if (FINDORPUT_SINGLE(tgt_state, d_q, bi, bj, bk, bl, hashtmp) == 0) {
+										if (FINDORPUT_SINGLE(tgt_state, d_q) == 0) {
 											// ERROR! hash table too full. Set CONTINUE to 2
 											CONTINUE = 2;
 										}
@@ -1219,7 +1223,7 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 										TMPVAR = STOREINCACHE(tgt_state, d_q, &bitmask);
 										if (TMPVAR == 2) {
 											// cache time-out; store directly in global hash table
-											if (FINDORPUT_SINGLE(tgt_state, d_q, bi, bj, bk, bl, hashtmp) == 0) {
+											if (FINDORPUT_SINGLE(tgt_state, d_q) == 0) {
 												// ERROR! hash table too full. Set CONTINUE to 2
 												CONTINUE = 2;
 											}
@@ -1328,7 +1332,7 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 			int have_new_state = i * WARPSIZE + LANE < k && ISNEWSTATE(&shared[CACHEOFFSET+(i*WARPSIZE+LANE)*d_sv_nints]);
 			while (c = __ballot(have_new_state)) {
 				int active_lane = __ffs(c) - 1;
-				if(FINDORPUT_WARP((inttype*) &shared[CACHEOFFSET + (i*WARPSIZE+active_lane)*d_sv_nints], d_q, bi, bj, bk, bl, bitmask, hashtmp) == 0) {
+				if(FINDORPUT_WARP((inttype*) &shared[CACHEOFFSET + (i*WARPSIZE+active_lane)*d_sv_nints], d_q) == 0) {
 					CONTINUE = 2;
 				}
 				if (LANE == active_lane) {
