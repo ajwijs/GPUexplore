@@ -57,7 +57,7 @@ __constant__ inttype d_nbits_syncbits_offset;
 __constant__ PropertyStatus d_property;
 
 // GPU shared memory array
-extern volatile __shared__ inttype shared[];
+extern __shared__ inttype shared[];
 
 // thread ids
 #define WARP_ID							(threadIdx.x / WARPSIZE)
@@ -105,14 +105,16 @@ const size_t Mb = 1<<20;
 #define VECTORPOSLEN					(d_nr_procs+1)
 #define LTSSTATESIZELEN					(d_nr_procs)
 #define OPENTILELEN						(d_sv_nints*(blockDim.x/d_nr_procs))
+#define TGTSTATELEN						(blockDim.x*d_sv_nints)
 #define THREADBUFFERLEN					((blockDim.x/d_nr_procs)*(THREADBUFFERSHARED+(d_nr_procs*d_max_buf_ints)))
 
 #define HASHCONSTANTSOFFSET 			(SH_OFFSET)
-#define VECTORPOSOFFSET 				(SH_OFFSET+HASHCONSTANTSLEN)
-#define LTSSTATESIZEOFFSET 				(SH_OFFSET+HASHCONSTANTSLEN+VECTORPOSLEN)
-#define OPENTILEOFFSET 					(SH_OFFSET+HASHCONSTANTSLEN+VECTORPOSLEN+LTSSTATESIZELEN)
-#define THREADBUFFEROFFSET	 			(SH_OFFSET+HASHCONSTANTSLEN+VECTORPOSLEN+LTSSTATESIZELEN+OPENTILELEN)
-#define CACHEOFFSET 					(SH_OFFSET+HASHCONSTANTSLEN+VECTORPOSLEN+LTSSTATESIZELEN+OPENTILELEN+THREADBUFFERLEN)
+#define VECTORPOSOFFSET 				(HASHCONSTANTSOFFSET+HASHCONSTANTSLEN)
+#define LTSSTATESIZEOFFSET 				(VECTORPOSOFFSET+VECTORPOSLEN)
+#define OPENTILEOFFSET 					(LTSSTATESIZEOFFSET+LTSSTATESIZELEN)
+#define TGTSTATEOFFSET		 			(OPENTILEOFFSET+OPENTILELEN)
+#define THREADBUFFEROFFSET	 			(TGTSTATEOFFSET+TGTSTATELEN)
+#define CACHEOFFSET 					(THREADBUFFEROFFSET+THREADBUFFERLEN)
 
 // One int for sync action counter
 // One int for POR counter
@@ -808,9 +810,9 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 	//inttype group_nr = threadIdx.x / nr_procs;
 	inttype i, k, l, index, offset1, offset2, tmp, cont, act, sync_offset1, sync_offset2;
 	int32_t local_action_counter;
-	inttype src_state[MAX_SIZE], tgt_state[MAX_SIZE];
-	inttype bitmask, bi, bj, bk, bl;
-	indextype hashtmp;
+	inttype* src_state = &shared[OPENTILEOFFSET+(threadIdx.x/d_nr_procs)*d_sv_nints];
+	inttype* tgt_state = &shared[TGTSTATEOFFSET+threadIdx.x*d_sv_nints];
+	inttype bitmask, bi, bj, bk;
 	int pos;
 	// TODO: remove this
 	inttype TMPVAR;
@@ -853,14 +855,14 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		// Scan the open set for work; we use the OPENTILECOUNT flag at this stage to count retrieved elements
 		if (scan || ITERATIONS == 0) {
 			for (i = GLOBAL_WARP_ID; i < d_nrbuckets && OPENTILECOUNT < OPENTILELEN; i += NR_WARPS) {
-				src_state[0] = d_q[(i*WARPSIZE)+LANE];
+				tmp = d_q[(i*WARPSIZE)+LANE];
 				l = OPENTILELEN;
 				if (ENTRY_ID == (d_sv_nints-1)) {
-					if (ISNEWINT(src_state[0])) {
+					if (ISNEWINT(tmp)) {
 						// try to increment the OPENTILECOUNT counter, if successful, store the state
 						l = atomicAdd((uint32_t *) &OPENTILECOUNT, d_sv_nints);
 						if (l < OPENTILELEN) {
-							d_q[(i*WARPSIZE)+LANE] = OLDINT(src_state[0]);
+							d_q[(i*WARPSIZE)+LANE] = OLDINT(tmp);
 						}
 					}
 				}
@@ -869,7 +871,7 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 					l = __shfl(l, LANE-ENTRY_ID+d_sv_nints-1);
 					if (l < OPENTILELEN) {
 						// write part of vector to shared memory
-						shared[OPENTILEOFFSET+l+ENTRY_ID] = src_state[0];
+						shared[OPENTILEOFFSET+l+ENTRY_ID] = tmp;
 					}
 				}
 			}
@@ -884,23 +886,6 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		// is the thread part of an 'active' group?
 		offset1 = 0;
 		offset2 = 0;
-		// both group 'leaders' (group id 0) and threads at the start of a warp should read vector states,
-		// to be distributed among the other threads via shuffle operations
-		if (THREADINGROUP) {
-			if (LANE == 0 || GROUP_ID == 0) {
-				for (l = 0; l < d_sv_nints; l++) {
-					src_state[l] = OPENTILESTATEPART(l);
-				}
-			}
-			// every thread reads the state from the appropriate leader thread
-			for (l = 0; l < d_sv_nints; l++) {
-				src_state[l] = __shfl(src_state[l], (GROUP_ID > LANE) ? 0 : LANE-GROUP_ID);
-			}
-		}
-		// Reset the open queue tile
-		if (threadIdx.x < d_sv_nints*(blockDim.x / d_nr_procs)) {
-			shared[OPENTILEOFFSET+threadIdx.x] = EMPTYVECT32;
-		}
 		if (threadIdx.x == 0) {
 			OPENTILECOUNT = 0;
 		}
@@ -1324,6 +1309,10 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 					}
 				}
 			}
+		}
+		// Reset the open queue tile
+		if (threadIdx.x < d_sv_nints*(blockDim.x / d_nr_procs)) {
+			shared[OPENTILEOFFSET+threadIdx.x] = EMPTYVECT32;
 		}
 		// start scanning the local cache and write results to the global hash table
 		k = (d_shared_q_size-CACHEOFFSET)/d_sv_nints;
