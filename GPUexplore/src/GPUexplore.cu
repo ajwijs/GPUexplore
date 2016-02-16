@@ -68,6 +68,7 @@ extern __shared__ inttype shared[];
 //#define ENTRY_ID						(LANE % d_sv_nints)
 #define ENTRY_ID						(HALFLANE % d_sv_nints)
 #define GROUP_ID						(threadIdx.x % d_nr_procs)
+#define GROUP_GID						(threadIdx.x / d_nr_procs)
 
 //#define NREL_IN_BUCKET					((WARPSIZE / d_sv_nints))
 #define NREL_IN_BUCKET					((HALFWARPSIZE / d_sv_nints)*2)
@@ -359,15 +360,6 @@ __device__ inttype FINDORPUT_SINGLE(inttype* t, inttype* d_q) {
 			}
 			else {
 				SETOLDSTATE(t);
-				if (ITERATIONS < d_kernel_iters-1) {
-					bk = atomicAdd((inttype *) &OPENTILECOUNT, d_sv_nints);
-					if (bk < OPENTILELEN) {
-						d_q[hashtmp+STARTPOS_OF_EL_IN_BUCKET(bj)+(d_sv_nints-1)] = t[d_sv_nints-1];
-						for (bl = 0; bl < d_sv_nints; bl++) {
-							shared[OPENTILEOFFSET+bk+bl] = NEWSTATEPART(t, bl);
-						}
-					}
-				}
 				return 1;
 			}
 		}
@@ -388,30 +380,16 @@ __device__ inttype FINDORPUT_WARP(inttype* t, inttype* d_q)	{
 	for (bi = 0; bi < NR_HASH_FUNCTIONS; bi++) {
 		HASHFUNCTION(hashtmp, bi, t);
 		bl = d_q[hashtmp+LANE];
-//		if (t[0] == 167790159) {
-//			PRINTTHREAD(bi, STRIPPEDENTRY(bl, ENTRY_ID));
-//		}
 		bk = __ballot(STRIPPEDENTRY(bl, ENTRY_ID) == STRIPPEDSTATE(t, ENTRY_ID));
 		// threadstatus is used to determine whether full state vector has been found
 		threadstatus = EMPTY;
-//		if (t[0] == 167790159) {
-//			// print outcome
-//			PRINTTHREAD(33, bk);
-//		}
 		if (LANEPOINTSTOVALIDBUCKETPOS) {
-//			if (t[0] == 167790159) {
-//				PRINTTHREAD(bk & bitmask,bitmask);
-//			}
 			if ((bk & bitmask) == bitmask) {
-				//if (t[0] == 167790159) {
-				//	PRINTTHREAD(999,0);
-				//}
 				threadstatus = FOUND;
 			}
 		}
 		if (__ballot(threadstatus == FOUND) != 0) {
 			// state vector has been found in bucket. mark local copy as old.
-			//PRINTTHREAD(55, 0);
 			if (LANE == 0) {
 				SETOLDSTATE(t);
 			}
@@ -431,22 +409,20 @@ __device__ inttype FINDORPUT_WARP(inttype* t, inttype* d_q)	{
 					if (ENTRY_ID == d_sv_nints-1) {
 						SETOLDSTATE(t);
 					}
-					if (ITERATIONS < d_kernel_iters-1) {
-						// try to claim the state vector for future work
-						bl = OPENTILELEN;
-						if (ENTRY_ID == d_sv_nints-1) {
-							// try to increment the OPENTILECOUNT counter
-							bl = atomicAdd((inttype *) &OPENTILECOUNT, d_sv_nints);
-							if (bl < OPENTILELEN) {
-								d_q[hashtmp+LANE] = t[d_sv_nints-1];
-							}
-						}
-						// all active threads read the OPENTILECOUNT value of the first thread, and possibly store their part of the vector in the shared memory
-						bl = __shfl(bl, LANE-ENTRY_ID+d_sv_nints-1);
+					// try to claim the state vector for future work
+					bl = OPENTILELEN;
+					if (ENTRY_ID == d_sv_nints-1) {
+						// try to increment the OPENTILECOUNT counter
+						bl = atomicAdd((inttype *) &OPENTILECOUNT, d_sv_nints);
 						if (bl < OPENTILELEN) {
-							// write part of vector to shared memory
-							shared[OPENTILEOFFSET+bl+ENTRY_ID] = NEWSTATEPART(t, ENTRY_ID);
+							d_q[hashtmp+LANE] = t[d_sv_nints-1];
 						}
+					}
+					// all active threads read the OPENTILECOUNT value of the first thread, and possibly store their part of the vector in the shared memory
+					bl = __shfl(bl, LANE-ENTRY_ID+d_sv_nints-1);
+					if (bl < OPENTILELEN) {
+						// write part of vector to shared memory
+						shared[OPENTILEOFFSET+bl+ENTRY_ID] = NEWSTATEPART(t, ENTRY_ID);
 					}
 					// write was successful. propagate this to the whole warp by setting threadstatus to FOUND
 					threadstatus = FOUND;
@@ -851,18 +827,34 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		i += blockDim.x;
 	}
 	__syncthreads();
+	if(scan) {
+		//Copy the work tile from global mem
+		if (threadIdx.x < OPENTILELEN) {
+			shared[OPENTILEOFFSET+threadIdx.x] = d_q[d_nrbuckets*WARPSIZE + (OPENTILELEN+1) * blockIdx.x + threadIdx.x];
+		}
+		if(threadIdx.x == 0) {
+			OPENTILECOUNT = d_q[d_nrbuckets*WARPSIZE + (OPENTILELEN+1) * blockIdx.x + OPENTILELEN];
+		}
+	}
+	__syncthreads();
+	inttype last_search_location = 0;
 	while (ITERATIONS < d_kernel_iters) {
 		// Scan the open set for work; we use the OPENTILECOUNT flag at this stage to count retrieved elements
 		if (scan || ITERATIONS == 0) {
 			for (i = GLOBAL_WARP_ID; i < d_nrbuckets && OPENTILECOUNT < OPENTILELEN; i += NR_WARPS) {
-				tmp = d_q[(i*WARPSIZE)+LANE];
+				int loc = i + last_search_location;
+				if(loc >= d_nrbuckets) {
+					last_search_location = -i + GLOBAL_WARP_ID;
+					loc = i + last_search_location;
+				}
+				tmp = d_q[loc*WARPSIZE+LANE];
 				l = OPENTILELEN;
 				if (ENTRY_ID == (d_sv_nints-1)) {
 					if (ISNEWINT(tmp)) {
 						// try to increment the OPENTILECOUNT counter, if successful, store the state
 						l = atomicAdd((uint32_t *) &OPENTILECOUNT, d_sv_nints);
 						if (l < OPENTILELEN) {
-							d_q[(i*WARPSIZE)+LANE] = OLDINT(tmp);
+							d_q[loc*WARPSIZE+LANE] = OLDINT(tmp);
 						}
 					}
 				}
@@ -874,6 +866,11 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 						shared[OPENTILEOFFSET+l+ENTRY_ID] = tmp;
 					}
 				}
+			}
+			if(i < d_nrbuckets) {
+				last_search_location = i - GLOBAL_WARP_ID;
+			} else {
+				last_search_location = 0;
 			}
 		}
 		__syncthreads();
@@ -1311,9 +1308,13 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 			}
 		}
 		// Reset the open queue tile
-		if (threadIdx.x < d_sv_nints*(blockDim.x / d_nr_procs)) {
+		if (threadIdx.x < OPENTILELEN) {
 			shared[OPENTILEOFFSET+threadIdx.x] = EMPTYVECT32;
 		}
+		if (threadIdx.x == 0) {
+			OPENTILECOUNT = 0;
+		}
+		__syncthreads();
 		// start scanning the local cache and write results to the global hash table
 		k = (d_shared_q_size-CACHEOFFSET)/d_sv_nints;
 		int c;
@@ -1342,6 +1343,14 @@ __global__ void gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 			CONTINUE = 0;
 		}
 		__syncthreads();
+	}
+
+	//Copy the work tile to global mem
+	if (threadIdx.x < OPENTILELEN) {
+		d_q[d_nrbuckets*WARPSIZE + (OPENTILELEN+1) * blockIdx.x + threadIdx.x] = shared[OPENTILEOFFSET+threadIdx.x];
+	}
+	if(threadIdx.x == 0) {
+		d_q[d_nrbuckets*WARPSIZE + (OPENTILELEN+1) * blockIdx.x + OPENTILELEN] = OPENTILECOUNT;
 	}
 }
 
@@ -1635,8 +1644,13 @@ int main(int argc, char** argv) {
 	//shared_q_size = 1000;
 	fprintf (stdout, "shared mem queue size: %lu, number of entries: %u\n", shared_q_size*sizeof(inttype), shared_q_size);
 
+	// determine actual nr of blocks
+	nblocks = MAX(1,MIN(prop.maxGridSize[0],nblocks));
+	fprintf (stdout, "nr. of blocks: %d, block size: %d, nr of kernel iterations: %d\n", nblocks, nthreadsperblock, kernel_iters);
+
 	// copy symbols
-	inttype nrbuckets = q_size / WARPSIZE;
+	inttype tablesize = q_size - nblocks * (sv_nints*(nthreadsperblock/nr_procs)+1);
+	inttype nrbuckets = tablesize / WARPSIZE;
 	cudaMemcpyToSymbol(d_nrbuckets, &nrbuckets, sizeof(inttype));
 	cudaMemcpyToSymbol(d_shared_q_size, &shared_q_size, sizeof(inttype));
 	cudaMemcpyToSymbol(d_nr_procs, &nr_procs, sizeof(inttype));
@@ -1648,11 +1662,7 @@ int main(int argc, char** argv) {
 	cudaMemcpyToSymbol(d_kernel_iters, &kernel_iters, sizeof(inttype));
 	cudaMemcpyToSymbol(d_property, &check_property, sizeof(inttype));
 
-	// determine actual nr of blocks
-	nblocks = MAX(1,MIN(prop.maxGridSize[0],nblocks));
-
 	// init the queue
-	fprintf (stdout, "nr. of blocks: %d, block size: %d, nr of kernel iterations: %d\n", nblocks, nthreadsperblock, kernel_iters);
 	init_queue<<<nblocks, nthreadsperblock>>>(d_q, q_size);
 	//cudaMemset(d_q, 0, q_size*sizeof(indextype));
 	store_initial<<<1,1>>>(d_q, d_h);
@@ -1675,7 +1685,7 @@ int main(int argc, char** argv) {
 	//nblocks = MAX(1,MIN(prop.maxGridSize[0], q_size/nthreadsperblock));
 
 	inttype zero = 0;
-	inttype *q_test = (inttype*) malloc(sizeof(inttype)*q_size);
+	inttype *q_test = (inttype*) malloc(sizeof(inttype)*tablesize);
 	int j = 0;
 	inttype scan = 0;
 	CUDA_CHECK_RETURN(cudaMemcpy(d_property_violation, &zero, sizeof(inttype), cudaMemcpyHostToDevice))
@@ -1700,12 +1710,12 @@ int main(int argc, char** argv) {
 				printf ("%d\n", j++);
 			}
 			else if (verbosity == 2) {
-				cudaMemcpy(q_test, d_q, q_size*sizeof(inttype), cudaMemcpyDeviceToHost);
-				count_local_queue(q_test, q_size, firstbit_statevector, nr_procs, sv_nints);
+				cudaMemcpy(q_test, d_q, tablesize*sizeof(inttype), cudaMemcpyDeviceToHost);
+				count_local_queue(q_test, tablesize, firstbit_statevector, nr_procs, sv_nints);
 			}
 			else if (verbosity == 3) {
-				cudaMemcpy(q_test, d_q, q_size*sizeof(inttype), cudaMemcpyDeviceToHost);
-				print_local_queue(stdout, q_test, q_size, firstbit_statevector, nr_procs, sv_nints);
+				cudaMemcpy(q_test, d_q, tablesize*sizeof(inttype), cudaMemcpyDeviceToHost);
+				print_local_queue(stdout, q_test, tablesize, firstbit_statevector, nr_procs, sv_nints);
 			}
 		}
 		//j++;
@@ -1747,8 +1757,8 @@ int main(int argc, char** argv) {
 
 	FILE* fout;
 	fout = fopen("/tmp/gpuexplore.debug", "w");
-	cudaMemcpy(q_test, d_q, q_size*sizeof(inttype), cudaMemcpyDeviceToHost);
-	print_local_queue(fout, q_test, q_size, firstbit_statevector, nr_procs, sv_nints);
+	cudaMemcpy(q_test, d_q, tablesize*sizeof(inttype), cudaMemcpyDeviceToHost);
+	print_local_queue(fout, q_test, tablesize, firstbit_statevector, nr_procs, sv_nints);
 	fclose(fout);
 
 	CUDA_CHECK_RETURN(cudaThreadSynchronize());	// Wait for the GPU launched work to complete
