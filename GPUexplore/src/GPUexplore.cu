@@ -1481,8 +1481,6 @@ int main(int argc, char** argv) {
 
 	// GPU datastructures for calculation
 	inttype *d_q;
-	// GPU queue indices
-	//inttype d_q_open, d_q_next, d_q_end;
 
 	if (argc == 1) {
 		fprintf(stderr, "ERROR: No input network given!\n");
@@ -1718,16 +1716,7 @@ int main(int argc, char** argv) {
 
 	fprintf (stdout, "global mem queue size: %lu, number of entries: %lu\n", q_size*sizeof(inttype), (indextype) q_size);
 
-	if (opensize == 0) {
-		opensize = q_size / 1000;
-	}
-	//fprintf (stdout, "global mem open set size: %lu, number of entries: %d\n", opensize*sizeof(int), (int) opensize);
-
-	// calculate nr of buckets
-	opensize = opensize / (WARPSIZE / nr_procs);
-
 	inttype shared_q_size = (int) prop.sharedMemPerBlock / sizeof(inttype);
-	//shared_q_size = 1000;
 	fprintf (stdout, "shared mem queue size: %lu, number of entries: %u\n", shared_q_size*sizeof(inttype), shared_q_size);
 
 	// determine actual nr of blocks
@@ -1750,25 +1739,12 @@ int main(int argc, char** argv) {
 
 	// init the queue
 	init_queue<<<nblocks, nthreadsperblock>>>(d_q, q_size);
-	//cudaMemset(d_q, 0, q_size*sizeof(indextype));
 	store_initial<<<1,1>>>(d_q, d_h);
-	//print_queue(d_q, q_size, firstbit_statevector, nr_procs, sv_nints);
 	for (int i = 0; i < 2*NR_HASH_FUNCTIONS; i++) {
 		fprintf (stdout, "hash constant %d: %d\n", i, h[i]);
 	}
 	FIRSTHASHHOST(i);
 	fprintf (stdout, "hash of initial state: %d\n", i);
-	// set pointers
-	//d_q_open = 0;
-	//d_q_next = 1;
-	//d_q_end = 1;
-
-	// test: scan the entire queue
-	//scan_queue<<<nblocks, nthreadsperblock>>>(d_q, q_size);
-
-	// number of blocks required for iteration
-	//nblocks = MAX(1,MIN(prop.maxGridSize[0],((d_q_next-d_q_open)/sv_nints) / (nthreadsperblock / nr_procs)));
-	//nblocks = MAX(1,MIN(prop.maxGridSize[0], q_size/nthreadsperblock));
 
 	inttype zero = 0;
 	inttype *q_test = (inttype*) malloc(sizeof(inttype)*tablesize);
@@ -1776,7 +1752,6 @@ int main(int argc, char** argv) {
 	inttype scan = 0;
 	CUDA_CHECK_RETURN(cudaMemcpy(d_property_violation, &zero, sizeof(inttype), cudaMemcpyHostToDevice))
 	inttype property_violation = 0;
-	//inttype itercount = 0;
 	while (contBFS == 1) {
 		CUDA_CHECK_RETURN(cudaMemcpy(d_contBFS, &zero, sizeof(inttype), cudaMemcpyHostToDevice))
 		gather<<<nblocks, nthreadsperblock, shared_q_size*sizeof(inttype)>>>(d_q, d_h, d_bits_state, d_firstbit_statevector, d_proc_offsets_start,
@@ -1804,15 +1779,7 @@ int main(int argc, char** argv) {
 				print_local_queue(stdout, q_test, tablesize, firstbit_statevector, nr_procs, sv_nints);
 			}
 		}
-		//j++;
-		//if (j == 1) {
 		scan = 1;
-		//}
-		// TODO: remove
-//		itercount++;
-//		if (itercount == 20) {
-//			break;
-//		}
 	}
 	// determine runtime
 	stop = clock();
@@ -1836,18 +1803,16 @@ int main(int argc, char** argv) {
 	if (contBFS == 2) {
 		fprintf (stderr, "ERROR: problem with hash table\n");
 	}
-	//else {
-	// TODO: uncomment
-	// count_queue(d_q, q_size, firstbit_statevector, nr_procs, sv_nints);
-	//}
+	count_queue(d_q, tablesize, firstbit_statevector, nr_procs, sv_nints);
 
-	FILE* fout;
-	fout = fopen("/tmp/gpuexplore.debug", "w");
-	cudaMemcpy(q_test, d_q, tablesize*sizeof(inttype), cudaMemcpyDeviceToHost);
-	print_local_queue(fout, q_test, tablesize, firstbit_statevector, nr_procs, sv_nints);
-	fclose(fout);
+	// Debugging functionality: print states to file
+//	FILE* fout;
+//	fout = fopen("/tmp/gpuexplore.debug", "w");
+//	cudaMemcpy(q_test, d_q, tablesize*sizeof(inttype), cudaMemcpyDeviceToHost);
+//	print_local_queue(fout, q_test, tablesize, firstbit_statevector, nr_procs, sv_nints);
+//	fclose(fout);
 
-	CUDA_CHECK_RETURN(cudaThreadSynchronize());	// Wait for the GPU launched work to complete
+	CUDA_CHECK_RETURN(cudaDeviceSynchronize());	// Wait for the GPU launched work to complete
 	//CUDA_CHECK_RETURN(cudaGetLastError());
 
 	return 0;
