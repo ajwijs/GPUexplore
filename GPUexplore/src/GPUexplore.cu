@@ -553,18 +553,6 @@ __device__ inttype FINDORPUT_WARP_ORIG(inttype* t, inttype* d_q, inttype bi, int
 }
 
 // macro to print state vector
-//#define PRINTVECTOR(s) 							{	printf ("("); \
-//													for (bk = 0; bk < d_nr_procs; bk++) { \
-//														bitmask = 0; \
-//														SETBITS(shared[VECTORPOSOFFSET+bk],shared[VECTORPOSOFFSET+bk+1],bitmask); \
-//														bj = (s & bitmask) >> shared[VECTORPOSOFFSET+bk]; \
-//														printf ("%d", bj); \
-//														if (bk < (d_nr_procs-1)) { \
-//															printf (","); \
-//														} \
-//													} \
-//													printf (")\n"); \
-//												}
 #define PRINTVECTOR(s) 							{	printf ("("); \
 													for (bk = 0; bk < d_nr_procs; bk++) { \
 														GETSTATEVECTORSTATE(bj, (s), bk) \
@@ -1367,8 +1355,6 @@ int main(int argc, char** argv) {
 	int h[NR_HASH_FUNCTIONS*2];
 	// size of global hash table
 	size_t q_size = 0;
-	// size of open set
-	inttype opensize = 0;
 	PropertyStatus check_property = NONE;
 	// nr of iterations in single kernel run
 	int kernel_iters = KERNEL_ITERS;
@@ -1433,11 +1419,6 @@ int main(int argc, char** argv) {
 			if (verbosity > 3) {
 				verbosity = 3;
 			}
-			i += 2;
-		}
-		else if (!strcmp(argv[i],"-o")) {
-			// store open set size
-			opensize = atoi(argv[i+1]);
 			i += 2;
 		}
 		else if (!strcmp(argv[i],"-d")) {
