@@ -294,8 +294,9 @@ __device__ inttype STOREINCACHE(inttype* t, inttype* d_q, inttype* address) {
 												}
 #define HASHALL(a, i, t)						{	hashtmp = 0; \
 													for (bj = 0; bj < d_sv_nints; bj++) { \
-														hashtmp += (indextype) (shared[HASHCONSTANTSOFFSET+(2*(i))]*(STRIPPEDSTATE(t, bj))+shared[HASHCONSTANTSOFFSET+(2*(i))+1]); \
+														hashtmp += STRIPPEDSTATE(t,bj); \
 													} \
+													hashtmp = (indextype) (shared[HASHCONSTANTSOFFSET+(2*(i))]*(hashtmp)+shared[HASHCONSTANTSOFFSET+(2*(i))+1]); \
 													(a) = WARPSIZE*((inttype) ((hashtmp % P) % d_nrbuckets)); \
 												}
 #define HASHFUNCTION(a, i, t)					((HASHALL((a), (i), (t))))
