@@ -80,7 +80,7 @@ extern __shared__ inttype shared[];
 #define NREL_IN_BUCKET_HOST				((HALFWARPSIZE / sv_nints)*2)
 
 // constant for cuckoo hashing (Alcantara et al)
-static const inttype P = 334214459;
+static const inttype P = 979946131;
 // Retry constant to determine number of retries for element insertion
 #define RETRYFREQ 7
 #define NR_HASH_FUNCTIONS 8
@@ -347,8 +347,10 @@ __device__ void MARKINCACHE(inttype* t, inttype* d_q, int markNew) {
 												}
 #define HASHALL(a, i, t)						{	hashtmp = 0; \
 													for (bj = 0; bj < d_sv_nints; bj++) { \
-														hashtmp += (indextype) (shared[HASHCONSTANTSOFFSET+(2*(i))]*(STRIPPEDSTATE(t, bj))+shared[HASHCONSTANTSOFFSET+(2*(i))+1]); \
+														hashtmp += STRIPPEDSTATE(t,bj); \
+														hashtmp <<= 5; \
 													} \
+													hashtmp = (indextype) (shared[HASHCONSTANTSOFFSET+(2*(i))]*(hashtmp)+shared[HASHCONSTANTSOFFSET+(2*(i))+1]); \
 													(a) = WARPSIZE*((inttype) ((hashtmp % P) % d_nrbuckets)); \
 												}
 #define HASHFUNCTION(a, i, t)					((HASHALL((a), (i), (t))))
