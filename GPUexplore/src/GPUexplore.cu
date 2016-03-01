@@ -51,6 +51,7 @@ __constant__ inttype d_nr_procs;
 __constant__ inttype d_max_buf_ints;
 __constant__ inttype d_sv_nints;
 __constant__ inttype d_bits_act;
+__constant__ inttype d_nr_acts;
 __constant__ inttype d_nbits_offset;
 __constant__ inttype d_kernel_iters;
 __constant__ inttype d_nbits_syncbits_offset;
@@ -590,6 +591,9 @@ texture<inttype, 1, cudaReadModeElementType> tex_proc_trans_start;
 texture<inttype, 1, cudaReadModeElementType> tex_proc_trans;
 texture<inttype, 1, cudaReadModeElementType> tex_syncbits_offsets;
 texture<inttype, 1, cudaReadModeElementType> tex_syncbits;
+texture<inttype, 1, cudaReadModeElementType> tex_nes;
+texture<inttype, 1, cudaReadModeElementType> tex_nds;
+texture<inttype, 1, cudaReadModeElementType> tex_mc;
 
 /**
  * This macro checks return value of the CUDA runtime call and exits
@@ -1256,8 +1260,8 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
  */
 int main(int argc, char** argv) {
 	FILE *fp;
-	inttype nr_procs, bits_act, bits_statevector, sv_nints, nr_trans, proc_nrstates, nbits_offset, max_buf_ints, nr_syncbits_offsets, nr_syncbits, nbits_syncbits_offset;
-	inttype *bits_state, *firstbit_statevector, *proc_offsets, *proc_trans, *proc_offsets_start, *syncbits_offsets, *syncbits;
+	inttype nr_procs, bits_act, bits_statevector, sv_nints, nr_trans, proc_nrstates, nbits_offset, max_buf_ints, nr_syncbits_offsets, nr_syncbits, nbits_syncbits_offset, nr_acts;
+	inttype *bits_state, *firstbit_statevector, *proc_offsets, *proc_trans, *proc_offsets_start, *syncbits_offsets, *syncbits, *nes, *nds, *mc;
 	inttype contBFS;
 	char stmp[BUFFERSIZE], fn[50];
 	// to store constants for closed set hash functions
@@ -1283,6 +1287,8 @@ int main(int argc, char** argv) {
 
 	// GPU side versions of the input
 	inttype *d_bits_state, *d_firstbit_statevector, *d_proc_offsets_start, *d_proc_offsets, *d_proc_trans, *d_syncbits_offsets, *d_syncbits, *d_h;
+	// stubborn set POR information
+	inttype *d_nes, *d_nds, *d_mc;
 	// flag to keep track of progress and whether hash table errors occurred (value==2)
 	inttype *d_contBFS;
 	// flags to track which blocks have new states
@@ -1429,6 +1435,40 @@ int main(int argc, char** argv) {
 			syncbits[i] = atoi(stmp);
 			//fprintf(stdout, "syncbits %d: %d\n", i, syncbits[i]);
 		}
+		fgets(stmp, BUFFERSIZE, fp);
+		if (atoi(stmp)) {
+			// Load NES, NDS and MC matrices
+			fgets(stmp, BUFFERSIZE, fp);
+			nr_acts = atoi(stmp);
+			fprintf(stdout, "number of actions %d\n", nr_acts);
+			nes = (inttype*) malloc(sizeof(inttype)*nr_procs*nr_acts*((nr_acts+31)/32));
+			for (int i = 0; i < nr_procs; i++) {
+				for (int j = 0; j < nr_acts; j++) {
+					for (int k = 0; k < (nr_acts+31)/32; k++) {
+						fgets(stmp, BUFFERSIZE, fp);
+						nes[i*((nr_acts+31)/32)*nr_acts + j*((nr_acts+31)/32) + k] = atoi(stmp);
+					}
+				}
+			}
+			nds = (inttype*) malloc(sizeof(inttype)*nr_procs*nr_acts*((nr_acts+31)/32));
+			for (int i = 0; i < nr_procs; i++) {
+				for (int j = 0; j < nr_acts; j++) {
+					for (int k = 0; k < (nr_acts+31)/32; k++) {
+						fgets(stmp, BUFFERSIZE, fp);
+						nds[i*((nr_acts+31)/32)*nr_acts + j*((nr_acts+31)/32) + k] = atoi(stmp);
+					}
+				}
+			}
+			mc = (inttype*) malloc(sizeof(inttype)*nr_procs*nr_acts*((nr_acts+31)/32));
+			for (int i = 0; i < nr_procs; i++) {
+				for (int j = 0; j < nr_acts; j++) {
+					for (int k = 0; k < (nr_acts+31)/32; k++) {
+						fgets(stmp, BUFFERSIZE, fp);
+						mc[i*((nr_acts+31)/32)*nr_acts + j*((nr_acts+31)/32) + k] = atoi(stmp);
+					}
+				}
+			}
+		}
 	}
 	else {
 		fprintf(stderr, "ERROR: input network does not exist!\n");
@@ -1488,6 +1528,9 @@ int main(int argc, char** argv) {
 	cudaMallocCount((void **) &d_proc_trans, nr_trans*sizeof(inttype));
 	cudaMallocCount((void **) &d_syncbits_offsets, nr_syncbits_offsets*sizeof(inttype));
 	cudaMallocCount((void **) &d_syncbits, nr_syncbits*sizeof(inttype));
+	cudaMallocCount((void **) &d_nes, nr_procs*nr_acts*((nr_acts+31)/32)*sizeof(inttype));
+	cudaMallocCount((void **) &d_nds, nr_procs*nr_acts*((nr_acts+31)/32)*sizeof(inttype));
+	cudaMallocCount((void **) &d_mc, nr_procs*nr_acts*((nr_acts+31)/32)*sizeof(inttype));
 	cudaMallocCount((void **) &d_newstate_flags, nblocks*sizeof(inttype));
 
 	// Copy data to GPU
@@ -1500,6 +1543,9 @@ int main(int argc, char** argv) {
 	CUDA_CHECK_RETURN(cudaMemcpy(d_proc_trans, proc_trans, nr_trans*sizeof(inttype), cudaMemcpyHostToDevice))
 	CUDA_CHECK_RETURN(cudaMemcpy(d_syncbits_offsets, syncbits_offsets, nr_syncbits_offsets*sizeof(inttype), cudaMemcpyHostToDevice))
 	CUDA_CHECK_RETURN(cudaMemcpy(d_syncbits, syncbits, nr_syncbits*sizeof(inttype), cudaMemcpyHostToDevice))
+	CUDA_CHECK_RETURN(cudaMemcpy(d_nes, nes, nr_procs*nr_acts*((nr_acts+31)/32)*sizeof(inttype), cudaMemcpyHostToDevice))
+	CUDA_CHECK_RETURN(cudaMemcpy(d_nds, nds, nr_procs*nr_acts*((nr_acts+31)/32)*sizeof(inttype), cudaMemcpyHostToDevice))
+	CUDA_CHECK_RETURN(cudaMemcpy(d_mc, mc, nr_procs*nr_acts*((nr_acts+31)/32)*sizeof(inttype), cudaMemcpyHostToDevice))
 	CUDA_CHECK_RETURN(cudaMemset(d_newstate_flags, 0, nblocks*sizeof(inttype)));
 
 	// Bind data to textures
@@ -1508,6 +1554,9 @@ int main(int argc, char** argv) {
 	cudaBindTexture(NULL, tex_proc_trans, d_proc_trans, nr_trans*sizeof(inttype));
 	cudaBindTexture(NULL, tex_syncbits_offsets, d_syncbits_offsets, nr_syncbits_offsets*sizeof(inttype));
 	cudaBindTexture(NULL, tex_syncbits, d_syncbits, nr_syncbits*sizeof(inttype));
+	cudaBindTexture(NULL, tex_nes, d_nes, nr_procs*nr_acts*((nr_acts+31)/32)*sizeof(inttype));
+	cudaBindTexture(NULL, tex_nds, d_nds, nr_procs*nr_acts*((nr_acts+31)/32)*sizeof(inttype));
+	cudaBindTexture(NULL, tex_mc, d_mc, nr_procs*nr_acts*((nr_acts+31)/32)*sizeof(inttype));
 
 	size_t available, total;
 	cudaMemGetInfo(&available, &total);
@@ -1540,6 +1589,7 @@ int main(int argc, char** argv) {
 	cudaMemcpyToSymbol(d_max_buf_ints, &max_buf_ints, sizeof(inttype));
 	cudaMemcpyToSymbol(d_sv_nints, &sv_nints, sizeof(inttype));
 	cudaMemcpyToSymbol(d_bits_act, &bits_act, sizeof(inttype));
+	cudaMemcpyToSymbol(d_nr_acts, &nr_acts, sizeof(inttype));
 	cudaMemcpyToSymbol(d_nbits_offset, &nbits_offset, sizeof(inttype));
 	cudaMemcpyToSymbol(d_nbits_syncbits_offset, &nbits_syncbits_offset, sizeof(inttype));
 	cudaMemcpyToSymbol(d_kernel_iters, &kernel_iters, sizeof(inttype));
