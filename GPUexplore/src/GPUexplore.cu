@@ -955,7 +955,6 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		// while there is work to be done
 		//int loopcounter = 0;
 		outtrans_enabled = 0;
-		local_action_counter = 0;
 		while (CONTINUE == 1) {
 			if (offset1 < offset2 || cont) {
 				if (!cont) {
@@ -1000,18 +999,6 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 											// ERROR! hash table too full. Set CONTINUE to 2
 											CONTINUE = 2;
 										}
-									} else if(local_action_counter != -1){
-										// Only keep unique pointers in the buffer
-										for(bk = bj = 0; bj < local_action_counter && bk == 0; bj++) {
-											if((THREADBUFFERGROUPPOS(GROUP_ID, bj) & 0x7FFFFFFF) == bi) {
-												bk = 1;
-											}
-										}
-										if(bk == 0) {
-											// Set the most-significant bit if we are not the owner
-											THREADBUFFERGROUPPOS(GROUP_ID,local_action_counter) = bi | (k << 31);
-											local_action_counter++;
-										}
 									}
 								}
 								else {
@@ -1047,82 +1034,11 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 								break;
 							}
 						}
-					} else {
-						THREADGROUPPOR = 0x80000000 | d_nr_procs;
 					}
 				} else {
 					atomicMin((unsigned int*)&THREADGROUPCOUNTER, act);
 				}
 			}
-			// All states following from local transitions
-			// are now checked in global memory to see if
-			// they are new.
-			k = (d_shared_q_size-CACHEOFFSET)/d_sv_nints;
-			int por_possible = 0;
-			int32_t index = -1;
-			int32_t c = 0;
-			while(1) {
-				if(__all(c >= local_action_counter)) {
-					break;
-				}
-				if(c < local_action_counter) {
-					index = THREADBUFFERGROUPPOS(GROUP_ID,c);
-				}
-				int active_lane = __ffs(__ballot((index & 0x80000000) == 0)) - 1;
-
-				if(active_lane == -1) {
-					c++;
-					continue;
-				}
-				int cache_index = __shfl(index, active_lane);
-				if(FIND_WARP((inttype*) &shared[CACHEOFFSET+cache_index], d_q) == 0) {
-					por_possible |= active_lane == LANE;
-				}
-				if(active_lane == LANE || ((index & 0x80000000) != 0)) {
-					c++;
-					index = -1;
-				}
-			}
-			__syncthreads();
-			if(por_possible) {
-				// At least one state following from a local
-				// transition is new, report that POR
-				// can be applied.
-				atomicMin((unsigned int*)&THREADGROUPPOR, 0x80000000 | GROUP_ID);
-			}
-			__syncthreads();
-			// Apply partial-order reduction by only retaining
-			// new states from one thread as new.
-			// Reset some variables to prevent further successor
-			// generation.
-			int do_por = 0;
-			if(THREADINGROUP) {
-				do_por = THREADGROUPPOR < (0x80000000 | d_nr_procs) && THREADGROUPPOR != 0;
-			}
-			__syncthreads();
-			if(do_por) {
-				// Cycle proviso is satisfied
-				for(int32_t c = 0; c < local_action_counter; c++) {
-					if((THREADGROUPPOR & 0x7FFFFFFF) != GROUP_ID) {
-						SETOLDSTATE( &shared[CACHEOFFSET+ (THREADBUFFERGROUPPOS(GROUP_ID,c) & 0x7FFFFFFF)] );
-					}
-					THREADBUFFERGROUPPOS(GROUP_ID,c) = 0;
-				}
-				cont = 0;
-				offset1 = offset2;
-				if (THREADINGROUP && GROUP_ID == 0) {
-					THREADGROUPCOUNTER = EXPLORATION_DONE;
-					THREADGROUPPOR = 0;
-				}
-			}
-			__syncthreads();
-			if(do_por == 0){
-				for(int32_t c = 0; c < local_action_counter; c++) {
-					SETNEWSTATE( &shared[CACHEOFFSET+ (THREADBUFFERGROUPPOS(GROUP_ID,c) & 0x7FFFFFFF)] );
-					THREADBUFFERGROUPPOS(GROUP_ID,c) = 0;
-				}
-			}
-			local_action_counter = -1;
 			__syncthreads();
 			// Now, we have obtained the info needed to combine process transitions
 			if(THREADINGROUP && THREADGROUPCOUNTER < (1 << d_bits_act)) {
