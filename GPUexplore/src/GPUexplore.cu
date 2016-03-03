@@ -498,9 +498,7 @@ __device__ inttype FIND_WARP(inttype* t, inttype* d_q)	{
 		}
 		// try to find empty position
 		threadstatus = (bl == EMPTYVECT32 && LANEPOINTSTOVALIDBUCKETPOS) ? EMPTY : TAKEN;
-		// let bk hold the smallest index of an available empty position
-		bk = __ffs(__ballot(threadstatus == EMPTY));
-		if(bk < 32) {
+		if(__any(threadstatus == EMPTY)) {
 			// There is an empty slot in this bucket and the state vector was not found
 			// State will also not be found after rehashing, so we return 0
 			return 0;
