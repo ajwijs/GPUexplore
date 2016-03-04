@@ -284,8 +284,10 @@ __device__ inttype STOREINCACHE(inttype* t, inttype* d_q, inttype* address) {
 // hash functions use bj variable
 #define FIRSTHASH(a, t)							{	hashtmp = 0; \
 													for (bj = 0; bj < d_sv_nints; bj++) { \
-														hashtmp += (indextype) (d_h[0]*(STRIPPEDSTATE(t, bj))+d_h[1]); \
+														hashtmp += STRIPPEDSTATE(t,bj); \
+														hashtmp <<= 5; \
 													} \
+													hashtmp = (indextype) (d_h[0]*hashtmp+d_h[1]); \
 													(a) = WARPSIZE*((inttype) ((hashtmp % P) % d_nrbuckets)); \
 												}
 #define FIRSTHASHHOST(a)						{	indextype hashtmp = 0; \
