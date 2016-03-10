@@ -51,7 +51,10 @@ __constant__ inttype d_nr_procs;
 __constant__ inttype d_max_buf_ints;
 __constant__ inttype d_sv_nints;
 __constant__ inttype d_bits_act;
-__constant__ inttype d_nr_acts;
+__constant__ inttype d_nr_sync_rules;
+__constant__ inttype d_nr_sync_acts;
+__constant__ inttype d_por_matrix_size;
+__constant__ inttype d_por_heur_n;
 __constant__ inttype d_nbits_offset;
 __constant__ inttype d_kernel_iters;
 __constant__ inttype d_nbits_syncbits_offset;
@@ -120,13 +123,16 @@ const size_t Mb = 1<<20;
 
 // One int for sync action counter
 // One int for POR counter
-#define THREADBUFFERSHARED				2
+#define THREADBUFFERSHARED				(2+(d_por_matrix_size+31)/32 * 3)
 // parameter is thread id
 #define THREADBUFFERGROUPSTART(i)		(THREADBUFFEROFFSET+(((i) / d_nr_procs)*(THREADBUFFERSHARED+(d_nr_procs*d_max_buf_ints))))
 // parameter is group id
 #define THREADBUFFERGROUPPOS(i, j)		shared[THREADBUFFERGROUPSTART(threadIdx.x)+THREADBUFFERSHARED+((i)*d_max_buf_ints)+(j)]
 #define THREADGROUPCOUNTER				shared[(THREADBUFFERGROUPSTART(threadIdx.x))]
 #define THREADGROUPPOR					shared[(THREADBUFFERGROUPSTART(threadIdx.x)) + 1]
+#define THREADGROUPWORK(i)				shared[(THREADBUFFERGROUPSTART(threadIdx.x)) + 2 + (i)]
+#define THREADGROUPSTUBBORN(i)			shared[(THREADBUFFERGROUPSTART(threadIdx.x)) + 2 + (d_por_matrix_size+31)/32 + (i)]
+#define THREADGROUPENABLED(i)			shared[(THREADBUFFERGROUPSTART(threadIdx.x)) + 2 + (d_por_matrix_size+31)/32*2 + (i)]
 #define OPENTILESTATEPART(i)			shared[OPENTILEOFFSET+(d_sv_nints*(threadIdx.x / d_nr_procs))+(i)]
 
 #define THREADINGROUP					(threadIdx.x < (blockDim.x/d_nr_procs)*d_nr_procs)
@@ -594,6 +600,206 @@ texture<inttype, 1, cudaReadModeElementType> tex_syncbits;
 texture<inttype, 1, cudaReadModeElementType> tex_nes;
 texture<inttype, 1, cudaReadModeElementType> tex_nds;
 texture<inttype, 1, cudaReadModeElementType> tex_mc;
+texture<inttype, 1, cudaReadModeElementType> tex_matrix_act_index;
+texture<inttype, 1, cudaReadModeElementType> tex_act_matrix_start;
+
+__device__ void compute_stubborn_set(inttype offset1, inttype offset2) {
+	int cont = 0;
+	volatile inttype act = 0;
+	volatile inttype bitmask, i, j, k, l, bj, bk, tmp, pos, sync_offset1, sync_offset2, index;
+	while (CONTINUE == 1) {
+		if (offset1 < offset2 || cont) {
+			if (!cont) {
+				// reset act
+				act = (1 << (d_bits_act));
+				// reset buffer of this thread
+				for (l = 0; l < d_max_buf_ints; l++) {
+					THREADBUFFERGROUPPOS(GROUP_ID, l) = 0;
+				}
+				// if not sync, set active bit
+				while (offset1 < offset2) {
+					tmp = tex1Dfetch(tex_proc_trans, offset1);
+					GETPROCTRANSSYNC(bitmask, tmp);
+					if (bitmask == 0) {
+						GETPROCTRANSACT(bitmask, tmp);
+						bitmask = bitmask - d_nr_sync_acts + d_nr_sync_rules;
+						atomicOr(&THREADGROUPENABLED(bitmask / 32), 1 << (bitmask % 32));
+						offset1++;
+					} else {
+						break;
+					}
+				}
+
+				// i is the current relative position in the buffer for this thread
+				i = 0;
+				if (offset1 < offset2) {
+					GETPROCTRANSACT(act, tmp);
+					// store transition entry
+					THREADBUFFERGROUPPOS(GROUP_ID,i) = tmp;
+					atomicMin((unsigned int*)&THREADGROUPCOUNTER, act);
+					cont = 1;
+					i++;
+					offset1++;
+					while (offset1 < offset2) {
+						tmp = tex1Dfetch(tex_proc_trans, offset1);
+						GETPROCTRANSACT(bitmask, tmp);
+						if (act == bitmask) {
+							THREADBUFFERGROUPPOS(GROUP_ID,i) = tmp;
+							i++;
+							offset1++;
+						} else {
+							break;
+						}
+					}
+				}
+			} else {
+				atomicMin((unsigned int*)&THREADGROUPCOUNTER, act);
+			}
+		}
+		__syncthreads();
+		// only active threads should do something
+		if (cont && THREADGROUPCOUNTER == act) {
+			// Now, we have obtained the info needed to combine process transitions
+			// syncbits Offset position
+			i = act/(INTSIZE/d_nbits_syncbits_offset);
+			pos = act - (i*(INTSIZE/d_nbits_syncbits_offset));
+			l = tex1Dfetch(tex_syncbits_offsets, i);
+			GETSYNCOFFSET(sync_offset1, l, pos);
+			if (pos == (INTSIZE/d_nbits_syncbits_offset)-1) {
+				l = tex1Dfetch(tex_syncbits_offsets, i+1);
+				GETSYNCOFFSET(sync_offset2, l, 0);
+			}
+			else {
+				GETSYNCOFFSET(sync_offset2, l, pos+1);
+			}
+			// iterate through the relevant syncbit filters
+			tmp = 1;
+			for (j = 0;sync_offset1 + j < sync_offset2 && tmp; j++) {
+				index = tex1Dfetch(tex_syncbits, sync_offset1+j);
+				for (i = 0; i < (INTSIZE/d_nr_procs); i++) {
+					GETSYNCRULE(tmp, index, i);
+					if (tmp != 0) {
+						OWNSSYNCRULE(bitmask, tmp, GROUP_ID);
+					}
+					else {
+						bitmask = 0;
+					}
+					if (bitmask) {
+						// start combining entries in the buffer to create target states
+						// if sync rule applicable, construct the first successor
+						// copy src_state into tgt_state
+						SYNCRULEISAPPLICABLE(l, tmp, act);
+						if (l) {
+							bitmask = tex1Dfetch(tex_act_matrix_start, act) + j * (INTSIZE/d_nr_procs) + i;
+							atomicOr(&THREADGROUPENABLED(bitmask / 32), 1 << (bitmask % 32));
+						}
+					}
+				}
+			}
+			cont = 0;
+		}
+		// finished an iteration of adding states.
+		// Is there still work? (is another iteration required?)
+		if (threadIdx.x == 0) {
+			if (CONTINUE != 2) {
+				CONTINUE = 0;
+			}
+		}
+		__syncthreads();
+		if (THREADINGROUP) {
+			if ((offset1 < offset2) || cont) {
+				CONTINUE = 1;
+			}
+		}
+		if (THREADINGROUP && GROUP_ID == 0) {
+			THREADGROUPCOUNTER = 1 << d_bits_act;
+		}
+		__syncthreads();
+	}
+
+	if (GROUP_ID == 0 && THREADINGROUP) {
+		uint64_t vec_has_work = 0;
+		for (int c = (d_por_matrix_size + 31) / 32 - 1; c >= 0; c--) {
+			// Start search for enabled action in local actions
+			tmp = THREADGROUPENABLED(c);
+			bitmask = __clz(tmp);
+			if(bitmask < 32) {
+				THREADGROUPWORK(c) = 1 << 31 - bitmask;
+				SETBIT(c,vec_has_work);
+				break;
+			}
+		}
+//		if(vec_has_work) {
+//			printf("enabled set ");
+//			for (int c = 0; c < (d_por_matrix_size + 31) / 32; c++) {
+//				printf("%d ", THREADGROUPENABLED(c));
+//			}
+//			printf("\n");
+//		}
+//		uint64_t had_work = vec_has_work;
+		while (vec_has_work) {
+			// Gather a transition from the work set
+			i = __ffsll(vec_has_work) - 1;
+			j = __ffs(THREADGROUPWORK(i)) - 1;
+			act = i * 32 + j;
+			volatile int dbg = THREADGROUPWORK(i);
+			THREADGROUPWORK(i) &= ~(1 << j);
+			if(THREADGROUPWORK(i) == 0) {
+				// There is no more work in this integer
+				vec_has_work &= ~(1L << i);
+			}
+			THREADGROUPSTUBBORN(i) |= 1 << j;
+			if(THREADGROUPENABLED(i) & 1 << j) {
+				// Action is enabled
+				for (int c = 0; c < (d_por_matrix_size + 31) / 32; c++) {
+					tmp = tex1Dfetch(tex_mc, ((d_por_matrix_size + 31) / 32)*act + c) & ~THREADGROUPSTUBBORN(c);
+					if(tmp) {
+						THREADGROUPWORK(c) |= tmp;
+						vec_has_work |= 1L << c;
+					}
+				}
+			} else {
+				// Action is disabled
+				// Try to find enabled transition that is not co-enabled with act
+				int found_nds = 0;
+				for (int c = 0; c < (d_por_matrix_size + 31) / 32; c++) {
+					tmp = ~tex1Dfetch(tex_mc, ((d_por_matrix_size + 31) / 32)*act + c);
+					if (THREADGROUPENABLED(c) & tmp) {
+						// Found a transition, use its NDS
+						found_nds = 1;
+						int found_act = c * 32 + __ffs(THREADGROUPENABLED(c) & tmp) - 1;
+						for (int d = 0; d < (d_por_matrix_size + 31) / 32; d++) {
+							tmp = tex1Dfetch(tex_nds, ((d_por_matrix_size + 31) / 32)*found_act + d) & ~THREADGROUPSTUBBORN(d);
+							if(tmp) {
+								THREADGROUPWORK(d) |= tmp;
+								vec_has_work |= 1L << d;
+							}
+						}
+						break;
+					}
+				}
+
+				if(!found_nds) {
+					// Otherwise, use NES
+					for (int c = 0; c < (d_por_matrix_size + 31) / 32; c++) {
+						tmp = tex1Dfetch(tex_nes, ((d_por_matrix_size + 31) / 32)*act + c) & ~THREADGROUPSTUBBORN(c);
+						if(tmp) {
+							THREADGROUPWORK(c) |= tmp;
+							vec_has_work |= 1L << c;
+						}
+					}
+				}
+			}
+		}
+//		if(had_work) {
+//			printf("stubborn set ");
+//			for (int c = 0; c < (d_por_matrix_size + 31) / 32; c++) {
+//				printf("%d ", THREADGROUPSTUBBORN(c));
+//			}
+//			printf("\n");
+//		}
+	}
+}
 
 /**
  * This macro checks return value of the CUDA runtime call and exits
@@ -794,7 +1000,6 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 	//inttype global_id = (blockIdx.x * blockDim.x) + threadIdx.x;
 	//inttype group_nr = threadIdx.x / nr_procs;
 	inttype i, k, l, index, offset1, offset2, tmp, cont, act, sync_offset1, sync_offset2;
-	int32_t local_action_counter;
 	inttype* src_state = &shared[OPENTILEOFFSET+(threadIdx.x/d_nr_procs)*d_sv_nints];
 	inttype* tgt_state = &shared[TGTSTATEOFFSET+threadIdx.x*d_sv_nints];
 	inttype bitmask, bi, bj, bk;
@@ -942,12 +1147,22 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 			if (GROUP_ID == 0) {
 				// for later, when constructing successors for this state, set action counter to maximum
 				THREADGROUPCOUNTER = (1 << d_bits_act);
-				THREADGROUPPOR = 0;
+				THREADGROUPPOR = 0x7FFFFFFF;
+				for (i = 0; i < (d_por_matrix_size + 31) / 32; i++) {
+					THREADGROUPENABLED(i) = 0;
+					THREADGROUPWORK(i) = 0;
+					THREADGROUPSTUBBORN(i) = 0;
+				}
 			}
 		}
 		// iterate over the outgoing transitions of state 'cont'
 		// variable cont is reused to indicate whether the buffer content of this thread still needs processing
 		cont = 0;
+		if (threadIdx.x == 0) {
+			CONTINUE = 1;
+		}
+		__syncthreads();
+		compute_stubborn_set(offset1, offset2);
 		if (threadIdx.x == 0) {
 			CONTINUE = 1;
 		}
@@ -969,6 +1184,13 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 						tmp = tex1Dfetch(tex_proc_trans, offset1);
 						GETPROCTRANSSYNC(bitmask, tmp);
 						if (bitmask == 0) {
+							GETPROCTRANSACT(bitmask, tmp);
+							bitmask = bitmask - d_nr_sync_acts + d_nr_sync_rules;
+							if((THREADGROUPSTUBBORN(bitmask / 32) >> (bitmask % 32) & 1) == 0) {
+								// Action is not in stubborn set
+								offset1++;
+								continue;
+							}
 							// no deadlock
 							outtrans_enabled = 1;
 							// construct state
@@ -1057,8 +1279,8 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 				}
 				// iterate through the relevant syncbit filters
 				tmp = 1;
-				for (;sync_offset1 < sync_offset2 && tmp; sync_offset1++) {
-					index = tex1Dfetch(tex_syncbits, sync_offset1);
+				for (int j = 0;sync_offset1 +j < sync_offset2 && tmp; j++) {
+					index = tex1Dfetch(tex_syncbits, sync_offset1+j);
 					for (i = 0; i < (INTSIZE/d_nr_procs); i++) {
 						GETSYNCRULE(tmp, index, i);
 						if (tmp != 0) {
@@ -1072,7 +1294,8 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 							// if sync rule applicable, construct the first successor
 							// copy src_state into tgt_state
 							SYNCRULEISAPPLICABLE(l, tmp, act);
-							if (l) {
+							bitmask = tex1Dfetch(tex_act_matrix_start, act) + j * (INTSIZE/d_nr_procs) + i;
+							if (l && (THREADGROUPSTUBBORN(bitmask / 32) & 1 << bitmask % 32)) {
 								// source state is not a deadlock
 								outtrans_enabled = 1;
 								for (pos = 0; pos < d_sv_nints; pos++) {
@@ -1259,8 +1482,8 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
  */
 int main(int argc, char** argv) {
 	FILE *fp;
-	inttype nr_procs, bits_act, bits_statevector, sv_nints, nr_trans, proc_nrstates, nbits_offset, max_buf_ints, nr_syncbits_offsets, nr_syncbits, nbits_syncbits_offset, nr_acts;
-	inttype *bits_state, *firstbit_statevector, *proc_offsets, *proc_trans, *proc_offsets_start, *syncbits_offsets, *syncbits, *nes, *nds, *mc;
+	inttype nr_procs, bits_act, bits_statevector, sv_nints, nr_trans, proc_nrstates, nbits_offset, max_buf_ints, nr_syncbits_offsets, nr_syncbits, nbits_syncbits_offset, nr_sync_rules, nr_local_acts, nr_sync_acts, por_matrix_size;
+	inttype *bits_state, *firstbit_statevector, *proc_offsets, *proc_trans, *proc_offsets_start, *syncbits_offsets, *syncbits, *nes, *nds, *mc, *matrix_act_index, *act_matrix_start;
 	inttype contBFS;
 	char stmp[BUFFERSIZE], fn[50];
 	// to store constants for closed set hash functions
@@ -1287,7 +1510,7 @@ int main(int argc, char** argv) {
 	// GPU side versions of the input
 	inttype *d_bits_state, *d_firstbit_statevector, *d_proc_offsets_start, *d_proc_offsets, *d_proc_trans, *d_syncbits_offsets, *d_syncbits, *d_h;
 	// stubborn set POR information
-	inttype *d_nes, *d_nds, *d_mc;
+	inttype *d_nes, *d_nds, *d_mc, *d_matrix_act_index, *d_act_matrix_start;
 	// flag to keep track of progress and whether hash table errors occurred (value==2)
 	inttype *d_contBFS;
 	// flags to track which blocks have new states
@@ -1438,34 +1661,41 @@ int main(int argc, char** argv) {
 		if (atoi(stmp)) {
 			// Load NES, NDS and MC matrices
 			fgets(stmp, BUFFERSIZE, fp);
-			nr_acts = atoi(stmp);
-			fprintf(stdout, "number of actions %d\n", nr_acts);
-			nes = (inttype*) malloc(sizeof(inttype)*nr_procs*nr_acts*((nr_acts+31)/32));
-			for (int i = 0; i < nr_procs; i++) {
-				for (int j = 0; j < nr_acts; j++) {
-					for (int k = 0; k < (nr_acts+31)/32; k++) {
-						fgets(stmp, BUFFERSIZE, fp);
-						nes[i*((nr_acts+31)/32)*nr_acts + j*((nr_acts+31)/32) + k] = atoi(stmp);
-					}
-				}
+			nr_sync_rules = atoi(stmp);
+			fprintf(stdout, "number of sync rules %d\n", nr_sync_rules);
+			fgets(stmp, BUFFERSIZE, fp);
+			nr_local_acts = atoi(stmp);
+			fprintf(stdout, "number of local actions %d\n", nr_local_acts);
+			fgets(stmp, BUFFERSIZE, fp);
+			nr_sync_acts = atoi(stmp);
+			fprintf(stdout, "number of sync actions %d\n", nr_sync_acts);
+			fgets(stmp, BUFFERSIZE, fp);
+			por_matrix_size = atoi(stmp);
+			fprintf(stdout, "POR matrix size %d\n", por_matrix_size);
+			matrix_act_index = (inttype*) malloc(sizeof(inttype) * por_matrix_size);
+			for (int i = 0; i < por_matrix_size; i++) {
+				fgets(stmp, BUFFERSIZE, fp);
+				matrix_act_index[i] = atoi(stmp);
 			}
-			nds = (inttype*) malloc(sizeof(inttype)*nr_procs*nr_acts*((nr_acts+31)/32));
-			for (int i = 0; i < nr_procs; i++) {
-				for (int j = 0; j < nr_acts; j++) {
-					for (int k = 0; k < (nr_acts+31)/32; k++) {
-						fgets(stmp, BUFFERSIZE, fp);
-						nds[i*((nr_acts+31)/32)*nr_acts + j*((nr_acts+31)/32) + k] = atoi(stmp);
-					}
-				}
+			act_matrix_start = (inttype*) malloc(sizeof(inttype) * nr_sync_acts);
+			for (int i = 0; i < nr_sync_acts; i++) {
+				fgets(stmp, BUFFERSIZE, fp);
+				act_matrix_start[i] = atoi(stmp);
 			}
-			mc = (inttype*) malloc(sizeof(inttype)*nr_procs*nr_acts*((nr_acts+31)/32));
-			for (int i = 0; i < nr_procs; i++) {
-				for (int j = 0; j < nr_acts; j++) {
-					for (int k = 0; k < (nr_acts+31)/32; k++) {
-						fgets(stmp, BUFFERSIZE, fp);
-						mc[i*((nr_acts+31)/32)*nr_acts + j*((nr_acts+31)/32) + k] = atoi(stmp);
-					}
-				}
+			nes = (inttype*) malloc(sizeof(inttype)*por_matrix_size*((por_matrix_size+31)/32));
+			for (int i = 0; i < por_matrix_size*((por_matrix_size+31)/32); i++) {
+				fgets(stmp, BUFFERSIZE, fp);
+				nes[i] = atoi(stmp);
+			}
+			nds = (inttype*) malloc(sizeof(inttype)*por_matrix_size*((por_matrix_size+31)/32));
+			for (int i = 0; i < por_matrix_size*((por_matrix_size+31)/32); i++) {
+				fgets(stmp, BUFFERSIZE, fp);
+				nds[i] = atoi(stmp);
+			}
+			mc = (inttype*) malloc(sizeof(inttype)*por_matrix_size*((por_matrix_size+31)/32));
+			for (int i = 0; i < por_matrix_size*((por_matrix_size+31)/32); i++) {
+				fgets(stmp, BUFFERSIZE, fp);
+				mc[i] = atoi(stmp);
 			}
 		}
 	}
@@ -1527,9 +1757,11 @@ int main(int argc, char** argv) {
 	cudaMallocCount((void **) &d_proc_trans, nr_trans*sizeof(inttype));
 	cudaMallocCount((void **) &d_syncbits_offsets, nr_syncbits_offsets*sizeof(inttype));
 	cudaMallocCount((void **) &d_syncbits, nr_syncbits*sizeof(inttype));
-	cudaMallocCount((void **) &d_nes, nr_procs*nr_acts*((nr_acts+31)/32)*sizeof(inttype));
-	cudaMallocCount((void **) &d_nds, nr_procs*nr_acts*((nr_acts+31)/32)*sizeof(inttype));
-	cudaMallocCount((void **) &d_mc, nr_procs*nr_acts*((nr_acts+31)/32)*sizeof(inttype));
+	cudaMallocCount((void **) &d_nes, por_matrix_size*((por_matrix_size+31)/32)*sizeof(inttype));
+	cudaMallocCount((void **) &d_nds, por_matrix_size*((por_matrix_size+31)/32)*sizeof(inttype));
+	cudaMallocCount((void **) &d_mc, por_matrix_size*((por_matrix_size+31)/32)*sizeof(inttype));
+	cudaMallocCount((void **) &d_matrix_act_index, por_matrix_size*sizeof(inttype));
+	cudaMallocCount((void **) &d_act_matrix_start, nr_sync_acts*sizeof(inttype));
 	cudaMallocCount((void **) &d_newstate_flags, nblocks*sizeof(inttype));
 
 	// Copy data to GPU
@@ -1542,9 +1774,11 @@ int main(int argc, char** argv) {
 	CUDA_CHECK_RETURN(cudaMemcpy(d_proc_trans, proc_trans, nr_trans*sizeof(inttype), cudaMemcpyHostToDevice))
 	CUDA_CHECK_RETURN(cudaMemcpy(d_syncbits_offsets, syncbits_offsets, nr_syncbits_offsets*sizeof(inttype), cudaMemcpyHostToDevice))
 	CUDA_CHECK_RETURN(cudaMemcpy(d_syncbits, syncbits, nr_syncbits*sizeof(inttype), cudaMemcpyHostToDevice))
-	CUDA_CHECK_RETURN(cudaMemcpy(d_nes, nes, nr_procs*nr_acts*((nr_acts+31)/32)*sizeof(inttype), cudaMemcpyHostToDevice))
-	CUDA_CHECK_RETURN(cudaMemcpy(d_nds, nds, nr_procs*nr_acts*((nr_acts+31)/32)*sizeof(inttype), cudaMemcpyHostToDevice))
-	CUDA_CHECK_RETURN(cudaMemcpy(d_mc, mc, nr_procs*nr_acts*((nr_acts+31)/32)*sizeof(inttype), cudaMemcpyHostToDevice))
+	CUDA_CHECK_RETURN(cudaMemcpy(d_nes, nes, por_matrix_size*((por_matrix_size+31)/32)*sizeof(inttype), cudaMemcpyHostToDevice))
+	CUDA_CHECK_RETURN(cudaMemcpy(d_nds, nds, por_matrix_size*((por_matrix_size+31)/32)*sizeof(inttype), cudaMemcpyHostToDevice))
+	CUDA_CHECK_RETURN(cudaMemcpy(d_mc, mc, por_matrix_size*((por_matrix_size+31)/32)*sizeof(inttype), cudaMemcpyHostToDevice))
+	CUDA_CHECK_RETURN(cudaMemcpy(d_matrix_act_index, matrix_act_index, por_matrix_size*sizeof(inttype), cudaMemcpyHostToDevice))
+	CUDA_CHECK_RETURN(cudaMemcpy(d_act_matrix_start, act_matrix_start, nr_sync_acts*sizeof(inttype), cudaMemcpyHostToDevice))
 	CUDA_CHECK_RETURN(cudaMemset(d_newstate_flags, 0, nblocks*sizeof(inttype)));
 
 	// Bind data to textures
@@ -1553,9 +1787,11 @@ int main(int argc, char** argv) {
 	cudaBindTexture(NULL, tex_proc_trans, d_proc_trans, nr_trans*sizeof(inttype));
 	cudaBindTexture(NULL, tex_syncbits_offsets, d_syncbits_offsets, nr_syncbits_offsets*sizeof(inttype));
 	cudaBindTexture(NULL, tex_syncbits, d_syncbits, nr_syncbits*sizeof(inttype));
-	cudaBindTexture(NULL, tex_nes, d_nes, nr_procs*nr_acts*((nr_acts+31)/32)*sizeof(inttype));
-	cudaBindTexture(NULL, tex_nds, d_nds, nr_procs*nr_acts*((nr_acts+31)/32)*sizeof(inttype));
-	cudaBindTexture(NULL, tex_mc, d_mc, nr_procs*nr_acts*((nr_acts+31)/32)*sizeof(inttype));
+	cudaBindTexture(NULL, tex_nes, d_nes, por_matrix_size*((por_matrix_size+31)/32)*sizeof(inttype));
+	cudaBindTexture(NULL, tex_nds, d_nds, por_matrix_size*((por_matrix_size+31)/32)*sizeof(inttype));
+	cudaBindTexture(NULL, tex_mc, d_mc, por_matrix_size*((por_matrix_size+31)/32)*sizeof(inttype));
+	cudaBindTexture(NULL, tex_matrix_act_index, d_matrix_act_index, por_matrix_size*sizeof(inttype));
+	cudaBindTexture(NULL, tex_act_matrix_start, d_act_matrix_start, nr_sync_acts*sizeof(inttype));
 
 	size_t available, total;
 	cudaMemGetInfo(&available, &total);
@@ -1582,13 +1818,23 @@ int main(int argc, char** argv) {
 	// copy symbols
 	inttype tablesize = q_size - nblocks * (sv_nints*(nthreadsperblock/nr_procs)+1);
 	inttype nrbuckets = tablesize / WARPSIZE;
+	inttype por_heur_n = 0;
+	for (int i = 0; i < nr_procs; i++) {
+		int max_succ = (31 - bits_act) / bits_state[i] * max_buf_ints * nr_procs;
+		if (max_succ > por_heur_n) {
+			por_heur_n = max_succ;
+		}
+	}
 	cudaMemcpyToSymbol(d_nrbuckets, &nrbuckets, sizeof(inttype));
 	cudaMemcpyToSymbol(d_shared_q_size, &shared_q_size, sizeof(inttype));
 	cudaMemcpyToSymbol(d_nr_procs, &nr_procs, sizeof(inttype));
 	cudaMemcpyToSymbol(d_max_buf_ints, &max_buf_ints, sizeof(inttype));
 	cudaMemcpyToSymbol(d_sv_nints, &sv_nints, sizeof(inttype));
 	cudaMemcpyToSymbol(d_bits_act, &bits_act, sizeof(inttype));
-	cudaMemcpyToSymbol(d_nr_acts, &nr_acts, sizeof(inttype));
+	cudaMemcpyToSymbol(d_nr_sync_rules, &nr_sync_rules, sizeof(inttype));
+	cudaMemcpyToSymbol(d_nr_sync_acts, &nr_sync_acts, sizeof(inttype));
+	cudaMemcpyToSymbol(d_por_matrix_size, &por_matrix_size, sizeof(inttype));
+	cudaMemcpyToSymbol(d_por_heur_n, &por_heur_n, sizeof(inttype));
 	cudaMemcpyToSymbol(d_nbits_offset, &nbits_offset, sizeof(inttype));
 	cudaMemcpyToSymbol(d_nbits_syncbits_offset, &nbits_syncbits_offset, sizeof(inttype));
 	cudaMemcpyToSymbol(d_kernel_iters, &kernel_iters, sizeof(inttype));
@@ -1612,7 +1858,8 @@ int main(int argc, char** argv) {
 	while (contBFS == 1) {
 		CUDA_CHECK_RETURN(cudaMemcpy(d_contBFS, &zero, sizeof(inttype), cudaMemcpyHostToDevice))
 		gather<<<nblocks, nthreadsperblock, shared_q_size*sizeof(inttype)>>>(d_q, d_h, d_bits_state, d_firstbit_statevector, d_proc_offsets_start,
-																		d_proc_offsets, d_proc_trans, d_syncbits_offsets, d_syncbits, d_contBFS, d_property_violation, d_newstate_flags, scan);
+																		d_proc_offsets, d_proc_trans, d_syncbits_offsets, d_syncbits,
+																		d_contBFS, d_property_violation, d_newstate_flags, scan);
 		// copy progress result
 		//CUDA_CHECK_RETURN(cudaGetLastError());
 		CUDA_CHECK_RETURN(cudaDeviceSynchronize());
