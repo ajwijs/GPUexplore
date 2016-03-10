@@ -54,6 +54,7 @@ __constant__ inttype d_bits_act;
 __constant__ inttype d_nr_sync_rules;
 __constant__ inttype d_nr_sync_acts;
 __constant__ inttype d_por_matrix_size;
+__constant__ inttype d_por_apply_heur;
 __constant__ inttype d_por_heur_n;
 __constant__ inttype d_nbits_offset;
 __constant__ inttype d_kernel_iters;
@@ -757,26 +758,63 @@ __device__ void compute_stubborn_set(inttype offset1, inttype offset2) {
 			} else {
 				// Action is disabled
 				// Try to find enabled transition that is not co-enabled with act
-				int found_nds = 0;
+				int best_nds_heur = ~(1 << 31);
+				int best_nds_act = d_por_matrix_size;
 				for (int c = 0; c < (d_por_matrix_size + 31) / 32; c++) {
 					tmp = ~tex1Dfetch(tex_mc, ((d_por_matrix_size + 31) / 32)*act + c);
-					if (THREADGROUPENABLED(c) & tmp) {
-						// Found a transition, use its NDS
-						found_nds = 1;
-						int found_act = c * 32 + __ffs(THREADGROUPENABLED(c) & tmp) - 1;
+					int trans = THREADGROUPENABLED(c) & tmp;
+					while (trans) {
+						// Found a transition, calculate heuristic for NDS
+						int found_act = c * 32 + __ffs(trans) - 1;
+						if(!d_por_apply_heur) {
+							c = (d_por_matrix_size + 31) / 32;
+							best_nds_heur = 0;
+							best_nds_act = found_act;
+							break;
+						}
+						trans &= ~(1 << __ffs(trans) - 1);
+						int heur = 0;
 						for (int d = 0; d < (d_por_matrix_size + 31) / 32; d++) {
-							tmp = tex1Dfetch(tex_nds, ((d_por_matrix_size + 31) / 32)*found_act + d) & ~THREADGROUPSTUBBORN(d);
+							tmp = tex1Dfetch(tex_nds, ((d_por_matrix_size + 31) / 32)*found_act + d) & ~THREADGROUPSTUBBORN(d) & ~THREADGROUPWORK(d);
 							if(tmp) {
-								THREADGROUPWORK(d) |= tmp;
-								vec_has_work |= 1L << d;
+								heur += __popc(tmp & ~THREADGROUPENABLED(d));
+								heur += __popc(tmp & THREADGROUPENABLED(d)) * d_por_heur_n;
+//								THREADGROUPWORK(d) |= tmp;
+//								vec_has_work |= 1L << d;
 							}
 						}
-						break;
+						if (heur < best_nds_heur) {
+							best_nds_heur = heur;
+							best_nds_act = found_act;
+						}
 					}
 				}
 
-				if(!found_nds) {
-					// Otherwise, use NES
+				int nes_heur = 1;
+				if(!d_por_apply_heur) {
+					int nes_heur = 0;
+					// Calculate heuristic for NES
+					for (int c = 0; c < (d_por_matrix_size + 31) / 32; c++) {
+						tmp = tex1Dfetch(tex_nes, ((d_por_matrix_size + 31) / 32)*act + c) & ~THREADGROUPSTUBBORN(c) & ~THREADGROUPWORK(c);
+						if(tmp) {
+							nes_heur += __popc(tmp & ~THREADGROUPENABLED(c));
+							nes_heur += __popc(tmp & THREADGROUPENABLED(c)) * d_por_heur_n;
+						}
+					}
+
+				}
+
+				if (best_nds_act < d_por_matrix_size && best_nds_heur < nes_heur) {
+					// Use the optimal NDS
+					for (int c = 0; c < (d_por_matrix_size + 31) / 32; c++) {
+						tmp = tex1Dfetch(tex_nds, ((d_por_matrix_size + 31) / 32)*best_nds_act + c) & ~THREADGROUPSTUBBORN(c);
+						if(tmp) {
+							THREADGROUPWORK(c) |= tmp;
+							vec_has_work |= 1L << c;
+						}
+					}
+				} else {
+					// Use the NES
 					for (int c = 0; c < (d_por_matrix_size + 31) / 32; c++) {
 						tmp = tex1Dfetch(tex_nes, ((d_por_matrix_size + 31) / 32)*act + c) & ~THREADGROUPSTUBBORN(c);
 						if(tmp) {
@@ -1479,7 +1517,7 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
  */
 int main(int argc, char** argv) {
 	FILE *fp;
-	inttype nr_procs, bits_act, bits_statevector, sv_nints, nr_trans, proc_nrstates, nbits_offset, max_buf_ints, nr_syncbits_offsets, nr_syncbits, nbits_syncbits_offset, nr_sync_rules, nr_local_acts, nr_sync_acts, por_matrix_size;
+	inttype nr_procs, bits_act, bits_statevector, sv_nints, nr_trans, proc_nrstates, nbits_offset, max_buf_ints, nr_syncbits_offsets, nr_syncbits, nbits_syncbits_offset, nr_sync_rules, nr_local_acts, nr_sync_acts, por_matrix_size, apply_heuristic;
 	inttype *bits_state, *firstbit_statevector, *proc_offsets, *proc_trans, *proc_offsets_start, *syncbits_offsets, *syncbits, *nes, *nds, *mc, *matrix_act_index, *act_matrix_start;
 	inttype contBFS;
 	char stmp[BUFFERSIZE], fn[50];
@@ -1494,6 +1532,8 @@ int main(int argc, char** argv) {
 	int nthreadsperblock = BLOCK_SIZE;
 	// level of verbosity (1=print level progress)
 	int verbosity = 0;
+	// POR stubborn set heuristic function
+	apply_heuristic = 1;
 	// clock to measure time
 	clock_t start, stop;
 	double runtime = 0.0;
@@ -1566,6 +1606,11 @@ int main(int argc, char** argv) {
 			// check a property
 			check_property = SAFETY;
 			i += 1;
+		}
+		else if (!strcmp(argv[i],"-h")) {
+			// apply heuristic function in POR stubborn set selection
+			apply_heuristic = atoi(argv[i+1]);
+			i += 2;
 		}
 	}
 
@@ -1831,6 +1876,7 @@ int main(int argc, char** argv) {
 	cudaMemcpyToSymbol(d_nr_sync_rules, &nr_sync_rules, sizeof(inttype));
 	cudaMemcpyToSymbol(d_nr_sync_acts, &nr_sync_acts, sizeof(inttype));
 	cudaMemcpyToSymbol(d_por_matrix_size, &por_matrix_size, sizeof(inttype));
+	cudaMemcpyToSymbol(d_por_apply_heur, &apply_heuristic, sizeof(inttype));
 	cudaMemcpyToSymbol(d_por_heur_n, &por_heur_n, sizeof(inttype));
 	cudaMemcpyToSymbol(d_nbits_offset, &nbits_offset, sizeof(inttype));
 	cudaMemcpyToSymbol(d_nbits_syncbits_offset, &nbits_syncbits_offset, sizeof(inttype));
