@@ -914,6 +914,10 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		}
 		__syncthreads();
 		if (THREADINGROUP) {
+			act = 1 << d_bits_act;
+			for (i = 0; i < d_max_buf_ints; i++) {
+				THREADBUFFERGROUPPOS(GROUP_ID, i) = 0;
+			}
 			// Is there work?
 			if (ISSTATE(src_state)) {
 				// Gather the required transition information for all states in the tile
@@ -1120,12 +1124,11 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 			}
 			local_action_counter = -1;
 			__syncthreads();
-			// only active threads should do something
-			if (cont && THREADGROUPCOUNTER == act) {
-				// Now, we have obtained the info needed to combine process transitions
+			// Now, we have obtained the info needed to combine process transitions
+			if(THREADINGROUP && THREADGROUPCOUNTER < (1 << d_bits_act)) {
 				// syncbits Offset position
-				i = act/(INTSIZE/d_nbits_syncbits_offset);
-				pos = act - (i*(INTSIZE/d_nbits_syncbits_offset));
+				i = THREADGROUPCOUNTER/(INTSIZE/d_nbits_syncbits_offset);
+				pos = THREADGROUPCOUNTER - (i*(INTSIZE/d_nbits_syncbits_offset));
 				l = tex1Dfetch(tex_syncbits_offsets, i);
 				GETSYNCOFFSET(sync_offset1, l, pos);
 				if (pos == (INTSIZE/d_nbits_syncbits_offset)-1) {
@@ -1135,112 +1138,110 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 				else {
 					GETSYNCOFFSET(sync_offset2, l, pos+1);
 				}
-				// iterate through the relevant syncbit filters
+				// the vector group iterates through the relevant syncbit filters
 				tmp = 1;
-				for (;sync_offset1 < sync_offset2 && tmp; sync_offset1++) {
-					index = tex1Dfetch(tex_syncbits, sync_offset1);
-					for (i = 0; i < (INTSIZE/d_nr_procs); i++) {
-						GETSYNCRULE(tmp, index, i);
-						if (tmp != 0) {
-							OWNSSYNCRULE(bitmask, tmp, GROUP_ID);
-						}
-						else {
-							bitmask = 0;
-						}
-						if (bitmask) {
-							// start combining entries in the buffer to create target states
-							// if sync rule applicable, construct the first successor
-							// copy src_state into tgt_state
-							SYNCRULEISAPPLICABLE(l, tmp, act);
-							if (l) {
-								// source state is not a deadlock
-								outtrans_enabled = 1;
-								for (pos = 0; pos < d_sv_nints; pos++) {
-									tgt_state[pos] = src_state[pos];
+				for (int j = GROUP_ID;
+						sync_offset1 + j / (INTSIZE/d_nr_procs) < sync_offset2 && tmp;
+						j += d_nr_procs) {
+					index = tex1Dfetch(tex_syncbits, sync_offset1 + j / (INTSIZE/d_nr_procs));
+					GETSYNCRULE(tmp, index, j % (INTSIZE/d_nr_procs));
+					if (tmp) {
+						// start combining entries in the buffer to create target states
+						// if sync rule applicable, construct the first successor
+						// copy src_state into tgt_state
+						SYNCRULEISAPPLICABLE(l, tmp, THREADGROUPCOUNTER);
+						if (l) {
+							// source state is not a deadlock
+							outtrans_enabled = 1;
+							for (pos = 0; pos < d_sv_nints; pos++) {
+								tgt_state[pos] = src_state[pos];
+							}
+							// construct first successor
+							for (pos = 0; pos < d_nr_procs; pos++) {
+								if (GETBIT(pos, tmp)) {
+									// get first state
+									GETPROCTRANSSTATE(k, THREADBUFFERGROUPPOS(pos,0), 1, pos);
+									SETSTATEVECTORSTATE(tgt_state, pos, k-1);
 								}
-								// construct first successor
-								for (pos = 0; pos < d_nr_procs; pos++) {
-									if (GETBIT(pos, tmp)) {
-										// get first state
-										GETPROCTRANSSTATE(k, THREADBUFFERGROUPPOS(pos,0), 1, pos);
-										SETSTATEVECTORSTATE(tgt_state, pos, k-1);
+							}
+							SETNEWSTATE(tgt_state);
+							// while we keep getting new states, store them
+							while (ISNEWSTATE(tgt_state)) {
+								// check for violation of safety property, if required
+								if (d_property == SAFETY) {
+									GETSTATEVECTORSTATE(pos, tgt_state, d_nr_procs-1);
+									if (pos == 1) {
+										// error state found
+										(*d_property_violation) = 1;
 									}
 								}
-								SETNEWSTATE(tgt_state);
-								// while we keep getting new states, store them
-								while (ISNEWSTATE(tgt_state)) {
-									// check for violation of safety property, if required
-									if (d_property == SAFETY) {
-										GETSTATEVECTORSTATE(pos, tgt_state, d_nr_procs-1);
-										if (pos == 1) {
-											// error state found
-											(*d_property_violation) = 1;
-										}
-									}
 
-									// store tgt_state in cache; if i == d_shared_q_size, state was found, duplicate detected
-									// if i == d_shared_q_size+1, cache is full, immediately store in global hash table
-									TMPVAR = STOREINCACHE(tgt_state, d_q, &bitmask);
-									if (TMPVAR == 2) {
-										// cache time-out; store directly in global hash table
-										if (FINDORPUT_SINGLE(tgt_state, d_q, d_newstate_flags) == 0) {
-											// ERROR! hash table too full. Set CONTINUE to 2
-											CONTINUE = 2;
-										}
+								// store tgt_state in cache; if i == d_shared_q_size, state was found, duplicate detected
+								// if i == d_shared_q_size+1, cache is full, immediately store in global hash table
+								TMPVAR = STOREINCACHE(tgt_state, d_q, &bitmask);
+								if (TMPVAR == 2) {
+									// cache time-out; store directly in global hash table
+									if (FINDORPUT_SINGLE(tgt_state, d_q, d_newstate_flags) == 0) {
+										// ERROR! hash table too full. Set CONTINUE to 2
+										CONTINUE = 2;
 									}
-									// get next successor
-									for (pos = d_nr_procs-1; pos > (int) GROUP_ID-1; pos--) {
-										if (GETBIT(pos,tmp)) {
-											GETSTATEVECTORSTATE(cont, tgt_state, pos);
-											int st = 0;
-											for (k = 0; k < d_max_buf_ints; k++) {
-												for (l = 1; l <= NR_OF_STATES_IN_TRANSENTRY(pos); l++) {
-													GETPROCTRANSSTATE(st, THREADBUFFERGROUPPOS(pos,k), l, pos);
-													if (cont == (st-1)) {
-														break;
-													}
-												}
-												if (cont == (st-1)) {
+								}
+								// get next successor
+								for (pos = d_nr_procs-1; pos >= 0; pos--) {
+									if (GETBIT(pos,tmp)) {
+										int curr_st;
+										GETSTATEVECTORSTATE(curr_st, tgt_state, pos);
+										int st = 0;
+										for (k = 0; k < d_max_buf_ints; k++) {
+											for (l = 1; l <= NR_OF_STATES_IN_TRANSENTRY(pos); l++) {
+												GETPROCTRANSSTATE(st, THREADBUFFERGROUPPOS(pos,k), l, pos);
+												if (curr_st == (st-1)) {
 													break;
 												}
 											}
-											// Assumption: element has been found (otherwise, 'last' was not a valid successor)
-											// Try to get the next element
-											if (l == NR_OF_STATES_IN_TRANSENTRY(pos)) {
-												if (k >= d_max_buf_ints-1) {
-													st = 0;
-												}
-												else {
-													k++;
-													l = 1;
-												}
+											if (curr_st == (st-1)) {
+												break;
+											}
+										}
+										// Assumption: element has been found (otherwise, 'last' was not a valid successor)
+										// Try to get the next element
+										if (l == NR_OF_STATES_IN_TRANSENTRY(pos)) {
+											if (k >= d_max_buf_ints-1) {
+												st = 0;
 											}
 											else {
-												l++;
+												k++;
+												l = 1;
 											}
-											// Retrieve next element, insert it in 'tgt_state' if it is not 0, and return result, otherwise continue
-											if (st != 0) {
-												GETPROCTRANSSTATE(st, THREADBUFFERGROUPPOS(pos,k), l, pos);
-												if (st > 0) {
-													SETSTATEVECTORSTATE(tgt_state, pos, st-1);
-													SETNEWSTATE(tgt_state);
-													break;
-												}
-											}
-											// else, set this process state to first one, and continue to next process
-											GETPROCTRANSSTATE(st, THREADBUFFERGROUPPOS(pos,0), 1, pos);
-											SETSTATEVECTORSTATE(tgt_state, pos, st-1);
 										}
+										else {
+											l++;
+										}
+										// Retrieve next element, insert it in 'tgt_state' if it is not 0, and return result, otherwise continue
+										if (st != 0) {
+											GETPROCTRANSSTATE(st, THREADBUFFERGROUPPOS(pos,k), l, pos);
+											if (st > 0) {
+												SETSTATEVECTORSTATE(tgt_state, pos, st-1);
+												SETNEWSTATE(tgt_state);
+												break;
+											}
+										}
+										// else, set this process state to first one, and continue to next process
+										GETPROCTRANSSTATE(st, THREADBUFFERGROUPPOS(pos,0), 1, pos);
+										SETSTATEVECTORSTATE(tgt_state, pos, st-1);
 									}
-									// did we find a successor? if not, set tgt_state to old
-									if (pos == (int) GROUP_ID-1) {
-										SETOLDSTATE(tgt_state);
-									}
+								}
+								// did we find a successor? if not, set tgt_state to old
+								if (pos == -1) {
+									SETOLDSTATE(tgt_state);
 								}
 							}
 						}
 					}
 				}
+			}
+			// only active threads should reset 'cont'
+			if (cont && THREADGROUPCOUNTER == act) {
 				cont = 0;
 			}
 			// finished an iteration of adding states.
