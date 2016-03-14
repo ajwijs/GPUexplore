@@ -606,8 +606,8 @@ texture<inttype, 1, cudaReadModeElementType> tex_act_matrix_start;
 
 __device__ void compute_stubborn_set(inttype offset1, inttype offset2) {
 	int cont = 0;
-	volatile inttype act = 0;
-	volatile inttype bitmask, i, j, k, l, bj, bk, tmp, pos, sync_offset1, sync_offset2, index;
+	inttype act = 0;
+	inttype bitmask, i, j, k, l, bj, bk, tmp, pos, sync_offset1, sync_offset2, index;
 	while (CONTINUE == 1) {
 		if (offset1 < offset2 || cont) {
 			if (!cont) {
@@ -739,7 +739,6 @@ __device__ void compute_stubborn_set(inttype offset1, inttype offset2) {
 			i = __ffsll(vec_has_work) - 1;
 			j = __ffs(THREADGROUPWORK(i)) - 1;
 			act = i * 32 + j;
-			volatile int dbg = THREADGROUPWORK(i);
 			THREADGROUPWORK(i) &= ~(1 << j);
 			if(THREADGROUPWORK(i) == 0) {
 				// There is no more work in this integer
