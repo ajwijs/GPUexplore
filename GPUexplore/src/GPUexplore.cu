@@ -736,6 +736,8 @@ __device__ void compute_stubborn_set(inttype offset1, inttype offset2) {
 	__syncthreads();
 	// Calculate masks that will be used to find actions belonging
 	// to this thread when gathering work.
+	// The idea is that every d_nr_procs'th bit belongs to this process
+	// Every process uses GROUP_ID as an offset
 	int work_mask1 = 0;
 	int work_mask2 = 0;
 	for (i = 0; i < 32; i+=d_nr_procs) {
@@ -743,6 +745,7 @@ __device__ void compute_stubborn_set(inttype offset1, inttype offset2) {
 		work_mask2 |= 1 << (32 - i - d_nr_procs);
 	}
 	while (CONTINUE) {
+		// act == -1 means we haven't found any work
 		act = -1;
 		if(THREADINGROUP && THREADGROUPPOR) {
 			// Gather a transition from the work set
@@ -750,10 +753,13 @@ __device__ void compute_stubborn_set(inttype offset1, inttype offset2) {
 				// funnelshift_l already "wraps" i, i.e. it uses i mod 32
 				// funnelshift_lc would "clamp" i, i.e. it uses min(i,32)
 				int offset_mask = __funnelshift_l(work_mask2,work_mask1,i);
+				// We are only interested in the bits that belong to this thread
 				tmp = THREADGROUPWORK(i / 32) & offset_mask;
 				if (tmp) {
 					act = __ffs(tmp) - 1 + i / 32 * 32;
 				}
+				// The next bit this thread has to inspect is the current offset (i)
+				// plus the amount of bits we have seen in this iteration (popc(offset_mask) * d_nr_procs)
 				i += d_nr_procs * __popc(offset_mask);
 			}
 			if (act != -1) {
