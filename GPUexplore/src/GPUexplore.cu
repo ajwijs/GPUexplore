@@ -831,6 +831,7 @@ __device__ void compute_stubborn_set(inttype offset1, inttype offset2) {
 							if(tmp) {
 								atomicOr(&THREADGROUPWORK(c), tmp);
 							}
+
 						}
 					}
 				}
