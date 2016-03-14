@@ -608,6 +608,8 @@ __device__ void compute_stubborn_set(inttype offset1, inttype offset2) {
 	int cont = 0;
 	inttype act = 0;
 	inttype bitmask, i, j, k, l, bj, bk, tmp, pos, sync_offset1, sync_offset2, index;
+	// Start by calculating which transitions are enabled
+	// THREADGROUPENABLED bits are set to 1 for enabled transitions
 	while (CONTINUE == 1) {
 		if (offset1 < offset2 || cont) {
 			if (!cont) {
@@ -715,122 +717,141 @@ __device__ void compute_stubborn_set(inttype offset1, inttype offset2) {
 	}
 
 	if (GROUP_ID == 0 && THREADINGROUP) {
-		uint64_t vec_has_work = 0;
+		// The leader thread copies one transition from the enabled set
+		// to the work set.
 		for (int c = (d_por_matrix_size + 31) / 32 - 1; c >= 0; c--) {
 			// Start search for enabled action in local actions
 			tmp = THREADGROUPENABLED(c);
 			bitmask = __clz(tmp);
 			if(bitmask < 32) {
 				THREADGROUPWORK(c) = 1 << 31 - bitmask;
-				SETBIT(c,vec_has_work);
 				break;
 			}
 		}
-//		if(vec_has_work) {
-//			printf("enabled set ");
-//			for (int c = 0; c < (d_por_matrix_size + 31) / 32; c++) {
-//				printf("%d ", THREADGROUPENABLED(c));
-//			}
-//			printf("\n");
-//		}
-//		uint64_t had_work = vec_has_work;
-		while (vec_has_work) {
+		THREADGROUPPOR = 1;
+		if (threadIdx.x == 0) {
+			CONTINUE = 1;
+		}
+	}
+	__syncthreads();
+	// Calculate masks that will be used to find actions belonging
+	// to this thread when gathering work.
+	int work_mask1 = 0;
+	int work_mask2 = 0;
+	for (i = 0; i < 32; i+=d_nr_procs) {
+		work_mask1 |= 1 << i;
+		work_mask2 |= 1 << (32 - i - d_nr_procs);
+	}
+	while (CONTINUE) {
+		act = -1;
+		if(THREADINGROUP && THREADGROUPPOR) {
 			// Gather a transition from the work set
-			i = __ffsll(vec_has_work) - 1;
-			j = __ffs(THREADGROUPWORK(i)) - 1;
-			act = i * 32 + j;
-			THREADGROUPWORK(i) &= ~(1 << j);
-			if(THREADGROUPWORK(i) == 0) {
-				// There is no more work in this integer
-				vec_has_work &= ~(1L << i);
+			for (i = GROUP_ID; i < d_por_matrix_size && act == -1;) {
+				// funnelshift_l already "wraps" i, i.e. it uses i mod 32
+				// funnelshift_lc would "clamp" i, i.e. it uses min(i,32)
+				int offset_mask = __funnelshift_l(work_mask2,work_mask1,i);
+				tmp = THREADGROUPWORK(i / 32) & offset_mask;
+				if (tmp) {
+					act = __ffs(tmp) - 1 + i / 32 * 32;
+				}
+				i += d_nr_procs * __popc(offset_mask);
 			}
-			THREADGROUPSTUBBORN(i) |= 1 << j;
-			if(THREADGROUPENABLED(i) & 1 << j) {
-				// Action is enabled
-				for (int c = 0; c < (d_por_matrix_size + 31) / 32; c++) {
-					tmp = tex1Dfetch(tex_mc, ((d_por_matrix_size + 31) / 32)*act + c) & ~THREADGROUPSTUBBORN(c);
-					if(tmp) {
-						THREADGROUPWORK(c) |= tmp;
-						vec_has_work |= 1L << c;
-					}
-				}
-			} else {
-				// Action is disabled
-				// Try to find enabled transition that is not co-enabled with act
-				int best_nds_heur = ~(1 << 31);
-				int best_nds_act = d_por_matrix_size;
-				for (int c = 0; c < (d_por_matrix_size + 31) / 32; c++) {
-					tmp = ~tex1Dfetch(tex_mc, ((d_por_matrix_size + 31) / 32)*act + c);
-					int trans = THREADGROUPENABLED(c) & tmp;
-					while (trans) {
-						// Found a transition, calculate heuristic for NDS
-						int found_act = c * 32 + __ffs(trans) - 1;
-						if(!d_por_apply_heur) {
-							c = (d_por_matrix_size + 31) / 32;
-							best_nds_heur = 0;
-							best_nds_act = found_act;
-							break;
-						}
-						trans &= ~(1 << __ffs(trans) - 1);
-						int heur = 0;
-						for (int d = 0; d < (d_por_matrix_size + 31) / 32; d++) {
-							tmp = tex1Dfetch(tex_nds, ((d_por_matrix_size + 31) / 32)*found_act + d) & ~THREADGROUPSTUBBORN(d) & ~THREADGROUPWORK(d);
-							if(tmp) {
-								heur += __popc(tmp & ~THREADGROUPENABLED(d));
-								heur += __popc(tmp & THREADGROUPENABLED(d)) * d_por_heur_n;
-//								THREADGROUPWORK(d) |= tmp;
-//								vec_has_work |= 1L << d;
-							}
-						}
-						if (heur < best_nds_heur) {
-							best_nds_heur = heur;
-							best_nds_act = found_act;
-						}
-					}
-				}
-
-				int nes_heur = 1;
-				if(!d_por_apply_heur) {
-					int nes_heur = 0;
-					// Calculate heuristic for NES
+			if (act != -1) {
+				i = act / 32;
+				j = act % 32;
+				atomicAnd(&THREADGROUPWORK(i), ~(1 << j));
+				atomicOr(&THREADGROUPSTUBBORN(i), 1 << j);
+				if(THREADGROUPENABLED(i) & 1 << j) {
+					// Action is enabled
 					for (int c = 0; c < (d_por_matrix_size + 31) / 32; c++) {
-						tmp = tex1Dfetch(tex_nes, ((d_por_matrix_size + 31) / 32)*act + c) & ~THREADGROUPSTUBBORN(c) & ~THREADGROUPWORK(c);
+						tmp = tex1Dfetch(tex_mc, ((d_por_matrix_size + 31) / 32)*act + c) & ~THREADGROUPSTUBBORN(c);
 						if(tmp) {
-							nes_heur += __popc(tmp & ~THREADGROUPENABLED(c));
-							nes_heur += __popc(tmp & THREADGROUPENABLED(c)) * d_por_heur_n;
-						}
-					}
-
-				}
-
-				if (best_nds_act < d_por_matrix_size && best_nds_heur < nes_heur) {
-					// Use the optimal NDS
-					for (int c = 0; c < (d_por_matrix_size + 31) / 32; c++) {
-						tmp = tex1Dfetch(tex_nds, ((d_por_matrix_size + 31) / 32)*best_nds_act + c) & ~THREADGROUPSTUBBORN(c);
-						if(tmp) {
-							THREADGROUPWORK(c) |= tmp;
-							vec_has_work |= 1L << c;
+							atomicOr(&THREADGROUPWORK(c), tmp);
 						}
 					}
 				} else {
-					// Use the NES
+					// Action is disabled
+					// Try to find enabled transition that is not co-enabled with act
+					int best_nds_heur = ~(1 << 31);
+					int best_nds_act = d_por_matrix_size;
 					for (int c = 0; c < (d_por_matrix_size + 31) / 32; c++) {
-						tmp = tex1Dfetch(tex_nes, ((d_por_matrix_size + 31) / 32)*act + c) & ~THREADGROUPSTUBBORN(c);
-						if(tmp) {
-							THREADGROUPWORK(c) |= tmp;
-							vec_has_work |= 1L << c;
+						tmp = ~tex1Dfetch(tex_mc, ((d_por_matrix_size + 31) / 32)*act + c);
+						int trans = THREADGROUPENABLED(c) & tmp;
+						while (trans) {
+							// Found a transition, calculate heuristic for NDS
+							int found_act = c * 32 + __ffs(trans) - 1;
+							if(!d_por_apply_heur) {
+								c = (d_por_matrix_size + 31) / 32;
+								best_nds_heur = 0;
+								best_nds_act = found_act;
+								break;
+							}
+							trans &= ~(1 << __ffs(trans) - 1);
+							int heur = 0;
+							for (int d = 0; d < (d_por_matrix_size + 31) / 32; d++) {
+								tmp = tex1Dfetch(tex_nds, ((d_por_matrix_size + 31) / 32)*found_act + d) & ~THREADGROUPSTUBBORN(d) & ~THREADGROUPWORK(d);
+								if(tmp) {
+									heur += __popc(tmp & ~THREADGROUPENABLED(d));
+									heur += __popc(tmp & THREADGROUPENABLED(d)) * d_por_heur_n;
+								}
+							}
+							if (heur < best_nds_heur) {
+								best_nds_heur = heur;
+								best_nds_act = found_act;
+							}
+						}
+					}
+
+					int nes_heur = 1;
+					if(!d_por_apply_heur) {
+						int nes_heur = 0;
+						// Calculate heuristic for NES
+						for (int c = 0; c < (d_por_matrix_size + 31) / 32; c++) {
+							tmp = tex1Dfetch(tex_nes, ((d_por_matrix_size + 31) / 32)*act + c) & ~THREADGROUPSTUBBORN(c) & ~THREADGROUPWORK(c);
+							if(tmp) {
+								nes_heur += __popc(tmp & ~THREADGROUPENABLED(c));
+								nes_heur += __popc(tmp & THREADGROUPENABLED(c)) * d_por_heur_n;
+							}
+						}
+
+					}
+
+					if (best_nds_act < d_por_matrix_size && best_nds_heur < nes_heur) {
+						// Use the optimal NDS
+						for (int c = 0; c < (d_por_matrix_size + 31) / 32; c++) {
+							tmp = tex1Dfetch(tex_nds, ((d_por_matrix_size + 31) / 32)*best_nds_act + c) & ~THREADGROUPSTUBBORN(c);
+							if(tmp) {
+								atomicOr(&THREADGROUPWORK(c), tmp);
+							}
+						}
+					} else {
+						// Use the NES
+						for (int c = 0; c < (d_por_matrix_size + 31) / 32; c++) {
+							tmp = tex1Dfetch(tex_nes, ((d_por_matrix_size + 31) / 32)*act + c) & ~THREADGROUPSTUBBORN(c);
+							if(tmp) {
+								atomicOr(&THREADGROUPWORK(c), tmp);
+							}
 						}
 					}
 				}
 			}
 		}
-//		if(had_work) {
-//			printf("stubborn set ");
-//			for (int c = 0; c < (d_por_matrix_size + 31) / 32; c++) {
-//				printf("%d ", THREADGROUPSTUBBORN(c));
-//			}
-//			printf("\n");
-//		}
+		__syncthreads();
+		if (GROUP_ID == 0 && THREADINGROUP) {
+			THREADGROUPPOR = 0;
+		}
+		__syncthreads();
+		if (threadIdx.x == 0) {
+			CONTINUE = 0;
+		}
+		if (act != -1) {
+			THREADGROUPPOR = 1;
+		}
+		__syncthreads();
+		if (GROUP_ID == 0 && THREADINGROUP && THREADGROUPPOR) {
+			CONTINUE = 1;
+		}
+		__syncthreads();
 	}
 }
 
