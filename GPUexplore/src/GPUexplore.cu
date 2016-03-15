@@ -1074,6 +1074,8 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 											}
 										} else if(k >> 2) {
 											proviso_satisfied |= (k >> 1) & 1;
+										} else if (!d_check_cycle_proviso) {
+											SETPORSTATE(&shared[CACHEOFFSET + bi]);
 										}
 									} else {
 										MARKINCACHE(tgt_state, d_q, (THREADGROUPPOR >> GROUP_ID) & 1);
@@ -1200,6 +1202,8 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 									}
 								} else if(TMPVAR >> 2) {
 									rule_proviso |= (TMPVAR >> 1) & 1;
+								} else if (!d_check_cycle_proviso) {
+									SETPORSTATE(&shared[CACHEOFFSET + bitmask]);
 								}
 							} else {
 								MARKINCACHE(tgt_state, d_q, (THREADGROUPPOR & tmp) == tmp);
