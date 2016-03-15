@@ -55,6 +55,8 @@ __constant__ inttype d_nbits_offset;
 __constant__ inttype d_kernel_iters;
 __constant__ inttype d_nbits_syncbits_offset;
 __constant__ PropertyStatus d_property;
+__constant__ inttype d_apply_por;
+__constant__ inttype d_check_cycle_proviso;
 
 // GPU shared memory array
 extern __shared__ inttype shared[];
@@ -1012,352 +1014,357 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		//int loopcounter = 0;
 		outtrans_enabled = 0;
 		char generate = 1;
-		char proviso_satisfied = 0;
+		char proviso_satisfied = !d_check_cycle_proviso;
 		int cluster_trans = 1 << GROUP_ID;
 		int orig_offset1 = offset1;
 		while(generate > -1) {
-		while (CONTINUE == 1) {
-			if (offset1 < offset2 && !cont) {
-				// reset act
-				act = (1 << (d_bits_act));
-				// reset buffer of this thread
-				for (l = 0; l < d_max_buf_ints; l++) {
-					THREADBUFFERGROUPPOS(GROUP_ID, l) = 0;
-				}
-			}
-			// if not sync, store in hash table
-			// loop over all transentries
-			while (1) {
-				i = 1;
-				if(offset1 < offset2  && !cont) {
-					tmp = tex1Dfetch(tex_proc_trans, offset1);
-					GETPROCTRANSSYNC(i, tmp);
-				}
-				if (__any(i == 0)) {
-					if(i == 0) {
-						// no deadlock
-						outtrans_enabled = 1;
-						// construct state
-						for (l = 0; l < d_sv_nints; l++) {
-							tgt_state[l] = src_state[l];
-						}
-						offset1++;
+			while (CONTINUE == 1) {
+				if (offset1 < offset2 && !cont) {
+					// reset act
+					act = (1 << (d_bits_act));
+					// reset buffer of this thread
+					for (l = 0; l < d_max_buf_ints; l++) {
+						THREADBUFFERGROUPPOS(GROUP_ID, l) = 0;
 					}
-					// loop over this transentry
-					for (l = 1; __any(i == 0 && l <= NR_OF_STATES_IN_TRANSENTRY(GROUP_ID)); l++) {
+				}
+				// if not sync, store in hash table
+				// loop over all transentries
+				while (1) {
+					i = 1;
+					if(offset1 < offset2  && !cont) {
+						tmp = tex1Dfetch(tex_proc_trans, offset1);
+						GETPROCTRANSSYNC(i, tmp);
+					}
+					if (__any(i == 0)) {
 						if(i == 0) {
-							GETPROCTRANSSTATE(pos, tmp, l, GROUP_ID);
-							if (pos > 0) {
-								SETSTATEVECTORSTATE(tgt_state, GROUP_ID, pos-1);
-								// check for violation of safety property, if required
-								if (d_property == SAFETY) {
-									if (GROUP_ID == d_nr_procs-1) {
-										// pos contains state id + 1
-										// error state is state 1
-										if (pos == 2) {
-											// error state found
-											(*d_property_violation) = 1;
+							// no deadlock
+							outtrans_enabled = 1;
+							// construct state
+							for (l = 0; l < d_sv_nints; l++) {
+								tgt_state[l] = src_state[l];
+							}
+							offset1++;
+						}
+						// loop over this transentry
+						for (l = 1; __any(i == 0 && l <= NR_OF_STATES_IN_TRANSENTRY(GROUP_ID)); l++) {
+							if(i == 0) {
+								GETPROCTRANSSTATE(pos, tmp, l, GROUP_ID);
+								if (pos > 0) {
+									SETSTATEVECTORSTATE(tgt_state, GROUP_ID, pos-1);
+									// check for violation of safety property, if required
+									if (d_property == SAFETY) {
+										if (GROUP_ID == d_nr_procs-1) {
+											// pos contains state id + 1
+											// error state is state 1
+											if (pos == 2) {
+												// error state found
+												(*d_property_violation) = 1;
+											}
 										}
 									}
-								}
-								// store tgt_state in cache
-								// if k == 8, cache is full, immediately store in global hash table
-								if(generate == 1) {
-									k = STOREINCACHE(tgt_state, d_q, &bi);
-									if (k == 8) {
-										// cache time-out; store directly in global hash table
-										if (FINDORPUT_SINGLE(tgt_state, d_q, d_newstate_flags) == 0) {
-											// ERROR! hash table too full. Set CONTINUE to 2
-											CONTINUE = 2;
+									// store tgt_state in cache
+									// if k == 8, cache is full, immediately store in global hash table
+									if(generate == 1) {
+										k = STOREINCACHE(tgt_state, d_q, &bi);
+										if (k == 8) {
+											// cache time-out; store directly in global hash table
+											if (FINDORPUT_SINGLE(tgt_state, d_q, d_newstate_flags) == 0) {
+												// ERROR! hash table too full. Set CONTINUE to 2
+												CONTINUE = 2;
+											}
+										} else if(k >> 2) {
+											proviso_satisfied |= (k >> 1) & 1;
 										}
-									} else if(k >> 2) {
-										proviso_satisfied |= (k >> 1) & 1;
+									} else {
+										MARKINCACHE(tgt_state, d_q, (THREADGROUPPOR >> GROUP_ID) & 1);
 									}
 								} else {
-									MARKINCACHE(tgt_state, d_q, (THREADGROUPPOR >> GROUP_ID) & 1);
+									i = 1;
 								}
-							} else {
-								i = 1;
 							}
-						}
-						int c;
-						while(generate && (c = __ballot(i == 0 && (k >> 2 == 0)))) {
-							int active_lane = __ffs(c) - 1;
-							int cache_index = __shfl(bi, active_lane);
-							bj = FIND_WARP((inttype*) &shared[CACHEOFFSET + cache_index], d_q);
-							if(LANE == active_lane) {
-								i = 1;
-								if(bj == 0) {
-									proviso_satisfied = 1;
+							int c;
+							while(generate && d_apply_por && d_check_cycle_proviso && (c = __ballot(i == 0 && (k >> 2 == 0)))) {
+								int active_lane = __ffs(c) - 1;
+								int cache_index = __shfl(bi, active_lane);
+								bj = FIND_WARP((inttype*) &shared[CACHEOFFSET + cache_index], d_q);
+								if(LANE == active_lane) {
+									i = 1;
+									if(bj == 0) {
+										proviso_satisfied = 1;
+									}
 								}
 							}
 						}
-					}
-				} else {
-					break;
-				}
-			}
-
-			// i is the current relative position in the buffer for this thread
-			i = 0;
-			if (offset1 < offset2 && !cont) {
-				GETPROCTRANSACT(act, tmp);
-				// store transition entry
-				THREADBUFFERGROUPPOS(GROUP_ID,i) = tmp;
-				atomicMin((unsigned int*)&THREADGROUPCOUNTER, act);
-				cont = 1;
-				i++;
-				offset1++;
-				while (offset1 < offset2) {
-					tmp = tex1Dfetch(tex_proc_trans, offset1);
-					GETPROCTRANSACT(bitmask, tmp);
-					if (act == bitmask) {
-						THREADBUFFERGROUPPOS(GROUP_ID,i) = tmp;
-						i++;
-						offset1++;
-					}
-					else {
+					} else {
 						break;
 					}
 				}
-			} else if (cont) {
-				atomicMin((unsigned int*)&THREADGROUPCOUNTER, act);
-			}
-			__syncthreads();
-			// Now, we have obtained the info needed to combine process transitions
-			sync_offset1 = sync_offset2 = 0;
-			if(THREADINGROUP && THREADGROUPCOUNTER < (1 << d_bits_act)) {
-				// syncbits Offset position
-				i = THREADGROUPCOUNTER/(INTSIZE/d_nbits_syncbits_offset);
-				pos = THREADGROUPCOUNTER - (i*(INTSIZE/d_nbits_syncbits_offset));
-				l = tex1Dfetch(tex_syncbits_offsets, i);
-				GETSYNCOFFSET(sync_offset1, l, pos);
-				if (pos == (INTSIZE/d_nbits_syncbits_offset)-1) {
-					l = tex1Dfetch(tex_syncbits_offsets, i+1);
-					GETSYNCOFFSET(sync_offset2, l, 0);
-				}
-				else {
-					GETSYNCOFFSET(sync_offset2, l, pos+1);
-				}
-			}
-			// iterate through the relevant syncbit filters
-			tmp = 1;
-			for (int j = GROUP_ID;__any(sync_offset1 + j / (INTSIZE/d_nr_procs) < sync_offset2 && tmp); j+=d_nr_procs) {
-				index = 0;
-				if(THREADINGROUP && THREADGROUPCOUNTER < (1 << d_bits_act) && sync_offset1 + j / (INTSIZE/d_nr_procs) < sync_offset2 && tmp) {
-					index = tex1Dfetch(tex_syncbits, sync_offset1 + j / (INTSIZE/d_nr_procs));
-				}
-				GETSYNCRULE(tmp, index, j % (INTSIZE/d_nr_procs));
-				l = 0;
-				if(tmp) {
-					SYNCRULEISAPPLICABLE(l, tmp, THREADGROUPCOUNTER);
-				}
-				SETOLDSTATE(tgt_state);
-				if (l) {
-					// source state is not a deadlock
-					outtrans_enabled = 1;
-					// start combining entries in the buffer to create target states
-					// if sync rule applicable, construct the first successor
-					// copy src_state into tgt_state
-					for (pos = 0; pos < d_sv_nints; pos++) {
-						tgt_state[pos] = src_state[pos];
-					}
-					// construct first successor
-					for (pos = 0; pos < d_nr_procs; pos++) {
-						if (GETBIT(pos, tmp)) {
-							// get first state
-							GETPROCTRANSSTATE(k, THREADBUFFERGROUPPOS(pos,0), 1, pos);
-							SETSTATEVECTORSTATE(tgt_state, pos, k-1);
-						}
-					}
-					SETNEWSTATE(tgt_state);
-				}
-				int rule_proviso = 0;
-				// while we keep getting new states, store them
-				while (__any(ISNEWSTATE(tgt_state))) {
-					l = k = TMPVAR = bitmask = 0;
-					if(ISNEWSTATE(tgt_state)) {
-						// check for violation of safety property, if required
-						if (d_property == SAFETY) {
-							GETSTATEVECTORSTATE(pos, tgt_state, d_nr_procs-1);
-							if (pos == 1) {
-								// error state found
-								(*d_property_violation) = 1;
-							}
-						}
 
-						// store tgt_state in cache; if i == d_shared_q_size, state was found, duplicate detected
-						// if i == d_shared_q_size+1, cache is full, immediately store in global hash table
-						if(generate == 1) {
-							TMPVAR = STOREINCACHE(tgt_state, d_q, &bitmask);
-							if (TMPVAR == 8) {
-								// cache time-out; store directly in global hash table
-								if (FINDORPUT_SINGLE(tgt_state, d_q, d_newstate_flags) == 0) {
-									// ERROR! hash table too full. Set CONTINUE to 2
-									CONTINUE = 2;
+				// i is the current relative position in the buffer for this thread
+				i = 0;
+				if (offset1 < offset2 && !cont) {
+					GETPROCTRANSACT(act, tmp);
+					// store transition entry
+					THREADBUFFERGROUPPOS(GROUP_ID,i) = tmp;
+					atomicMin((unsigned int*)&THREADGROUPCOUNTER, act);
+					cont = 1;
+					i++;
+					offset1++;
+					while (offset1 < offset2) {
+						tmp = tex1Dfetch(tex_proc_trans, offset1);
+						GETPROCTRANSACT(bitmask, tmp);
+						if (act == bitmask) {
+							THREADBUFFERGROUPPOS(GROUP_ID,i) = tmp;
+							i++;
+							offset1++;
+						}
+						else {
+							break;
+						}
+					}
+				} else if (cont) {
+					atomicMin((unsigned int*)&THREADGROUPCOUNTER, act);
+				}
+				__syncthreads();
+				// Now, we have obtained the info needed to combine process transitions
+				sync_offset1 = sync_offset2 = 0;
+				if(THREADINGROUP && THREADGROUPCOUNTER < (1 << d_bits_act)) {
+					// syncbits Offset position
+					i = THREADGROUPCOUNTER/(INTSIZE/d_nbits_syncbits_offset);
+					pos = THREADGROUPCOUNTER - (i*(INTSIZE/d_nbits_syncbits_offset));
+					l = tex1Dfetch(tex_syncbits_offsets, i);
+					GETSYNCOFFSET(sync_offset1, l, pos);
+					if (pos == (INTSIZE/d_nbits_syncbits_offset)-1) {
+						l = tex1Dfetch(tex_syncbits_offsets, i+1);
+						GETSYNCOFFSET(sync_offset2, l, 0);
+					}
+					else {
+						GETSYNCOFFSET(sync_offset2, l, pos+1);
+					}
+				}
+				// iterate through the relevant syncbit filters
+				tmp = 1;
+				for (int j = GROUP_ID;__any(sync_offset1 + j / (INTSIZE/d_nr_procs) < sync_offset2 && tmp); j+=d_nr_procs) {
+					index = 0;
+					if(THREADINGROUP && THREADGROUPCOUNTER < (1 << d_bits_act) && sync_offset1 + j / (INTSIZE/d_nr_procs) < sync_offset2 && tmp) {
+						index = tex1Dfetch(tex_syncbits, sync_offset1 + j / (INTSIZE/d_nr_procs));
+					}
+					GETSYNCRULE(tmp, index, j % (INTSIZE/d_nr_procs));
+					l = 0;
+					if(tmp) {
+						SYNCRULEISAPPLICABLE(l, tmp, THREADGROUPCOUNTER);
+					}
+					SETOLDSTATE(tgt_state);
+					if (l) {
+						// source state is not a deadlock
+						outtrans_enabled = 1;
+						// start combining entries in the buffer to create target states
+						// if sync rule applicable, construct the first successor
+						// copy src_state into tgt_state
+						for (pos = 0; pos < d_sv_nints; pos++) {
+							tgt_state[pos] = src_state[pos];
+						}
+						// construct first successor
+						for (pos = 0; pos < d_nr_procs; pos++) {
+							if (GETBIT(pos, tmp)) {
+								// get first state
+								GETPROCTRANSSTATE(k, THREADBUFFERGROUPPOS(pos,0), 1, pos);
+								SETSTATEVECTORSTATE(tgt_state, pos, k-1);
+							}
+						}
+						SETNEWSTATE(tgt_state);
+					}
+					int rule_proviso = 0;
+					// while we keep getting new states, store them
+					while (__any(ISNEWSTATE(tgt_state))) {
+						l = k = TMPVAR = bitmask = 0;
+						if(ISNEWSTATE(tgt_state)) {
+							// check for violation of safety property, if required
+							if (d_property == SAFETY) {
+								GETSTATEVECTORSTATE(pos, tgt_state, d_nr_procs-1);
+								if (pos == 1) {
+									// error state found
+									(*d_property_violation) = 1;
 								}
-							} else if(TMPVAR >> 2) {
-								rule_proviso |= (TMPVAR >> 1) & 1;
 							}
-						} else {
-							MARKINCACHE(tgt_state, d_q, (THREADGROUPPOR & tmp) == tmp);
+
+							// store tgt_state in cache; if i == d_shared_q_size, state was found, duplicate detected
+							// if i == d_shared_q_size+1, cache is full, immediately store in global hash table
+							if(generate == 1) {
+								TMPVAR = STOREINCACHE(tgt_state, d_q, &bitmask);
+								if (TMPVAR == 8) {
+									// cache time-out; store directly in global hash table
+									if (FINDORPUT_SINGLE(tgt_state, d_q, d_newstate_flags) == 0) {
+										// ERROR! hash table too full. Set CONTINUE to 2
+										CONTINUE = 2;
+									}
+								} else if(TMPVAR >> 2) {
+									rule_proviso |= (TMPVAR >> 1) & 1;
+								}
+							} else {
+								MARKINCACHE(tgt_state, d_q, (THREADGROUPPOR & tmp) == tmp);
+							}
+							l = k = 1;
 						}
-						l = k = 1;
-					}
-					int c;
-					while(generate && (c = __ballot(l && TMPVAR >> 2 == 0))) {
-						int active_lane = __ffs(c) - 1;
-						int cache_index = __shfl(bitmask, active_lane);
-						bj = FIND_WARP((inttype*) &shared[CACHEOFFSET + cache_index], d_q);
-						if(LANE == active_lane) {
-							l = 0;
-							if(bj == 0) {
-								rule_proviso = 1;
+						int c;
+						while(generate && d_apply_por && d_check_cycle_proviso && (c = __ballot(l && TMPVAR >> 2 == 0))) {
+							int active_lane = __ffs(c) - 1;
+							int cache_index = __shfl(bitmask, active_lane);
+							bj = FIND_WARP((inttype*) &shared[CACHEOFFSET + cache_index], d_q);
+							if(LANE == active_lane) {
+								l = 0;
+								if(bj == 0) {
+									rule_proviso = 1;
+								}
 							}
 						}
-					}
-					if(k) {
-						// get next successor
-						for (pos = d_nr_procs-1; pos > - 1; pos--) {
-							if (GETBIT(pos,tmp)) {
-								int curr_st;
-								GETSTATEVECTORSTATE(curr_st, tgt_state, pos);
-								int st = 0;
-								for (k = 0; k < d_max_buf_ints; k++) {
-									for (l = 1; l <= NR_OF_STATES_IN_TRANSENTRY(pos); l++) {
-										GETPROCTRANSSTATE(st, THREADBUFFERGROUPPOS(pos,k), l, pos);
+						if(k) {
+							// get next successor
+							for (pos = d_nr_procs-1; pos > - 1; pos--) {
+								if (GETBIT(pos,tmp)) {
+									int curr_st;
+									GETSTATEVECTORSTATE(curr_st, tgt_state, pos);
+									int st = 0;
+									for (k = 0; k < d_max_buf_ints; k++) {
+										for (l = 1; l <= NR_OF_STATES_IN_TRANSENTRY(pos); l++) {
+											GETPROCTRANSSTATE(st, THREADBUFFERGROUPPOS(pos,k), l, pos);
+											if (curr_st == (st-1)) {
+												break;
+											}
+										}
 										if (curr_st == (st-1)) {
 											break;
 										}
 									}
-									if (curr_st == (st-1)) {
-										break;
-									}
-								}
-								// Assumption: element has been found (otherwise, 'last' was not a valid successor)
-								// Try to get the next element
-								if (l == NR_OF_STATES_IN_TRANSENTRY(pos)) {
-									if (k >= d_max_buf_ints-1) {
-										st = 0;
+									// Assumption: element has been found (otherwise, 'last' was not a valid successor)
+									// Try to get the next element
+									if (l == NR_OF_STATES_IN_TRANSENTRY(pos)) {
+										if (k >= d_max_buf_ints-1) {
+											st = 0;
+										}
+										else {
+											k++;
+											l = 1;
+										}
 									}
 									else {
-										k++;
-										l = 1;
+										l++;
 									}
-								}
-								else {
-									l++;
-								}
-								// Retrieve next element, insert it in 'tgt_state' if it is not 0, and return result, otherwise continue
-								if (st != 0) {
-									GETPROCTRANSSTATE(st, THREADBUFFERGROUPPOS(pos,k), l, pos);
-									if (st > 0) {
-										SETSTATEVECTORSTATE(tgt_state, pos, st-1);
-										SETNEWSTATE(tgt_state);
-										break;
+									// Retrieve next element, insert it in 'tgt_state' if it is not 0, and return result, otherwise continue
+									if (st != 0) {
+										GETPROCTRANSSTATE(st, THREADBUFFERGROUPPOS(pos,k), l, pos);
+										if (st > 0) {
+											SETSTATEVECTORSTATE(tgt_state, pos, st-1);
+											SETNEWSTATE(tgt_state);
+											break;
+										}
 									}
+									// else, set this process state to first one, and continue to next process
+									GETPROCTRANSSTATE(st, THREADBUFFERGROUPPOS(pos,0), 1, pos);
+									SETSTATEVECTORSTATE(tgt_state, pos, st-1);
 								}
-								// else, set this process state to first one, and continue to next process
-								GETPROCTRANSSTATE(st, THREADBUFFERGROUPPOS(pos,0), 1, pos);
-								SETSTATEVECTORSTATE(tgt_state, pos, st-1);
+							}
+							// did we find a successor? if not, set tgt_state to old
+							if (pos == -1) {
+									SETOLDSTATE(tgt_state);
 							}
 						}
-						// did we find a successor? if not, set tgt_state to old
-						if (pos == -1) {
-								SETOLDSTATE(tgt_state);
+					}
+					for (l = 0; l < d_nr_procs; l++) {
+						// Exchange the sync rules so every thread can update its cluster_trans
+						int sync_rule = __shfl(tmp, GTL((GROUP_ID + l) % d_nr_procs));
+						int proviso = __shfl(rule_proviso, GTL((GROUP_ID + l) % d_nr_procs));
+						if(GETBIT(GROUP_ID, sync_rule) && THREADGROUPCOUNTER == act) {
+							cluster_trans |= sync_rule;
+							proviso_satisfied |= proviso;
 						}
 					}
 				}
-				for (l = 0; l < d_nr_procs; l++) {
-					// Exchange the sync rules so every thread can update its cluster_trans
-					int sync_rule = __shfl(tmp, GTL((GROUP_ID + l) % d_nr_procs));
-					int proviso = __shfl(rule_proviso, GTL((GROUP_ID + l) % d_nr_procs));
-					if(GETBIT(GROUP_ID, sync_rule) && THREADGROUPCOUNTER == act) {
-						cluster_trans |= sync_rule;
-						proviso_satisfied |= proviso;
-					}
-				}
-			}
 
-			// only active threads should reset 'cont'
-			if (cont && THREADGROUPCOUNTER == act) {
-				cont = 0;
-			}
-			// finished an iteration of adding states.
-			// Is there still work? (is another iteration required?)
-			if (threadIdx.x == 0) {
-				if (CONTINUE != 2) {
-					CONTINUE = 0;
+				// only active threads should reset 'cont'
+				if (cont && THREADGROUPCOUNTER == act) {
+					cont = 0;
 				}
-			}
-			__syncthreads();
-			if (THREADINGROUP) {
-				if ((offset1 < offset2) || cont) {
+				// finished an iteration of adding states.
+				// Is there still work? (is another iteration required?)
+				if (threadIdx.x == 0) {
 					if (CONTINUE != 2) {
-						CONTINUE = 1;
+						CONTINUE = 0;
 					}
 				}
-			}
-			if (THREADINGROUP && GROUP_ID == 0) {
-				THREADGROUPCOUNTER = 1 << d_bits_act;
-			}
-			// FOR TEST PURPOSES!
-//			if (threadIdx.x == 0) {
-//				CONTINUE++;
-//			}
-			__syncthreads();
-		} // END WHILE CONTINUE == 1
+				__syncthreads();
+				if (THREADINGROUP) {
+					if ((offset1 < offset2) || cont) {
+						if (CONTINUE != 2) {
+							CONTINUE = 1;
+						}
+					}
+				}
+				if (THREADINGROUP && GROUP_ID == 0) {
+					THREADGROUPCOUNTER = 1 << d_bits_act;
+				}
+				// FOR TEST PURPOSES!
+	//			if (threadIdx.x == 0) {
+	//				CONTINUE++;
+	//			}
+				__syncthreads();
+			} // END WHILE CONTINUE == 1
 
-		if(generate == 1 && THREADINGROUP) {
-			// Choose a cluster for reduction
-			if(!proviso_satisfied) {
-				cluster_trans = cluster_trans & ~(1 << GROUP_ID);
-			}
-			THREADBUFFERGROUPPOS(GROUP_ID,0) = cluster_trans;
-			__syncthreads();
-			int apply_por = 1;
-			proviso_satisfied = 0;
-			for(i = 0; i < d_nr_procs && apply_por; i++) {
-				if(GETBIT(i, cluster_trans)) {
-					// This process synchronizes with process i
-					if((cluster_trans | THREADBUFFERGROUPPOS(i,0)) == cluster_trans) {
-						// Process i's actions do not go outside our cluster
-						// Keep the POR dream alive
-						proviso_satisfied |= GETBIT(i,THREADBUFFERGROUPPOS(i,0));
-					} else {
-						// Reduction cannot be applied based on the cluster of this thread
-						apply_por = 0;
+			if(generate == 1 && THREADINGROUP) {
+				// Choose a cluster for reduction
+				if(!proviso_satisfied) {
+					cluster_trans = cluster_trans & ~(1 << GROUP_ID);
+				}
+				THREADBUFFERGROUPPOS(GROUP_ID,0) = cluster_trans;
+				__syncthreads();
+				int apply_por = 1;
+				proviso_satisfied = 0;
+				for(i = 0; i < d_nr_procs && apply_por; i++) {
+					if(GETBIT(i, cluster_trans)) {
+						// This process synchronizes with process i
+						if((cluster_trans | THREADBUFFERGROUPPOS(i,0)) == cluster_trans) {
+							// Process i's actions do not go outside our cluster
+							// Keep the POR dream alive
+							proviso_satisfied |= GETBIT(i,THREADBUFFERGROUPPOS(i,0));
+						} else {
+							// Reduction cannot be applied based on the cluster of this thread
+							apply_por = 0;
+						}
 					}
 				}
-			}
-			__syncthreads();
-			if(!(apply_por && proviso_satisfied)) {
-				THREADBUFFERGROUPPOS(GROUP_ID,0) = 0;
-			}
-			__syncthreads();
-			if(GROUP_ID == 0) {
-				int min = d_nr_procs;
-				int cluster = 0xFFFFFFFF >> (INTSIZE - d_nr_procs);
-				for(i = 0; i < d_nr_procs; i++) {
-					if(THREADBUFFERGROUPPOS(i,0) > 0 && __popc(THREADBUFFERGROUPPOS(i,0)) < min) {
-						min = __popc(THREADBUFFERGROUPPOS(i,0));
-						cluster = THREADBUFFERGROUPPOS(i,0);
+				__syncthreads();
+				if(!(apply_por && proviso_satisfied)) {
+					THREADBUFFERGROUPPOS(GROUP_ID,0) = 0;
+				}
+				__syncthreads();
+				if(GROUP_ID == 0) {
+					int min = d_nr_procs;
+					int cluster = 0xFFFFFFFF >> (INTSIZE - d_nr_procs);
+					for(i = 0; i < d_nr_procs; i++) {
+						if(THREADBUFFERGROUPPOS(i,0) > 0 && __popc(THREADBUFFERGROUPPOS(i,0)) < min) {
+							min = __popc(THREADBUFFERGROUPPOS(i,0));
+							cluster = THREADBUFFERGROUPPOS(i,0);
+						}
+					}
+					THREADGROUPPOR = cluster;
+					if(cluster < (0xFFFFFFFF >> (INTSIZE - d_nr_procs))) {
+	//					printf("Selected cluster %d for POR\n",cluster);
 					}
 				}
-				THREADGROUPPOR = cluster;
-				if(cluster < (0xFFFFFFFF >> (INTSIZE - d_nr_procs))) {
-//					printf("Selected cluster %d for POR\n",cluster);
-				}
+				__syncthreads();
 			}
-			__syncthreads();
-		}
-		offset1 = orig_offset1;
-		if(THREADINGROUP) {
-			THREADGROUPCOUNTER = (1 << d_bits_act);
-		}
-		CONTINUE = 1;
-		generate--;
-		}
+			offset1 = orig_offset1;
+			if(THREADINGROUP) {
+				THREADGROUPCOUNTER = (1 << d_bits_act);
+			}
+			CONTINUE = 1;
+			if (d_apply_por) {
+				generate--;
+			} else {
+				generate = -1;
+			}
+		} // END while(generate > -1)
+
 		// have we encountered a deadlock state?
 		// we use the shared memory to communicate this to the group leaders
 		if (d_property == DEADLOCK) {
@@ -1443,6 +1450,9 @@ int main(int argc, char** argv) {
 	int kernel_iters = KERNEL_ITERS;
 	int nblocks = NR_OF_BLOCKS;
 	int nthreadsperblock = BLOCK_SIZE;
+	// POR options
+	int apply_por = 0;
+	int use_cycle_proviso = 0;
 	// level of verbosity (1=print level progress)
 	int verbosity = 0;
 	// clock to measure time
@@ -1509,11 +1519,25 @@ int main(int argc, char** argv) {
 		else if (!strcmp(argv[i],"-d")) {
 			// check for deadlocks
 			check_property = DEADLOCK;
+			use_cycle_proviso = 0;
 			i += 1;
 		}
 		else if (!strcmp(argv[i],"-p")) {
 			// check a property
 			check_property = SAFETY;
+			use_cycle_proviso = 1;
+			i += 1;
+		}
+		else if (!strcmp(argv[i],"--por")) {
+			// apply partial-order reduction
+			apply_por = 1;
+			i += 1;
+		}
+		else if (!strcmp(argv[i],"--cycle-proviso")) {
+			// use cycle proviso
+			if (check_property == NONE) {
+				use_cycle_proviso = 1;
+			}
 			i += 1;
 		}
 	}
@@ -1718,6 +1742,8 @@ int main(int argc, char** argv) {
 	cudaMemcpyToSymbol(d_nbits_syncbits_offset, &nbits_syncbits_offset, sizeof(inttype));
 	cudaMemcpyToSymbol(d_kernel_iters, &kernel_iters, sizeof(inttype));
 	cudaMemcpyToSymbol(d_property, &check_property, sizeof(inttype));
+	cudaMemcpyToSymbol(d_apply_por, &apply_por, sizeof(inttype));
+	cudaMemcpyToSymbol(d_check_cycle_proviso, &use_cycle_proviso, sizeof(inttype));
 
 	// init the queue
 	init_queue<<<nblocks, nthreadsperblock>>>(d_q, q_size);
