@@ -60,6 +60,8 @@ __constant__ inttype d_nbits_offset;
 __constant__ inttype d_kernel_iters;
 __constant__ inttype d_nbits_syncbits_offset;
 __constant__ PropertyStatus d_property;
+__constant__ inttype d_apply_por;
+__constant__ inttype d_check_cycle_proviso;
 
 // GPU shared memory array
 extern __shared__ inttype shared[];
@@ -1227,11 +1229,13 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 			CONTINUE = 1;
 		}
 		__syncthreads();
-		compute_stubborn_set(offset1, offset2);
-		if (threadIdx.x == 0) {
-			CONTINUE = 1;
+		if (d_apply_por) {
+			compute_stubborn_set(offset1, offset2);
+			if (threadIdx.x == 0) {
+				CONTINUE = 1;
+			}
+			__syncthreads();
 		}
-		__syncthreads();
 		// while there is work to be done
 		//int loopcounter = 0;
 		outtrans_enabled = 0;
@@ -1251,7 +1255,7 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 						if (bitmask == 0) {
 							GETPROCTRANSACT(bitmask, tmp);
 							bitmask = bitmask - d_nr_sync_acts + d_nr_sync_rules;
-							if((THREADGROUPSTUBBORN(bitmask / 32) >> (bitmask % 32) & 1) == 0) {
+							if(d_apply_por && (THREADGROUPSTUBBORN(bitmask / 32) >> (bitmask % 32) & 1) == 0) {
 								// Action is not in stubborn set
 								offset1++;
 								continue;
@@ -1354,7 +1358,7 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 						// copy src_state into tgt_state
 						SYNCRULEISAPPLICABLE(l, tmp, THREADGROUPCOUNTER);
 						bitmask = tex1Dfetch(tex_act_matrix_start, THREADGROUPCOUNTER) + j;
-						if (l && (THREADGROUPSTUBBORN(bitmask / 32) & 1 << bitmask % 32)) {
+						if (l && (!d_apply_por || (THREADGROUPSTUBBORN(bitmask / 32) & 1 << bitmask % 32))) {
 							// source state is not a deadlock
 							outtrans_enabled = 1;
 							for (pos = 0; pos < d_sv_nints; pos++) {
@@ -1557,6 +1561,9 @@ int main(int argc, char** argv) {
 	int kernel_iters = KERNEL_ITERS;
 	int nblocks = NR_OF_BLOCKS;
 	int nthreadsperblock = BLOCK_SIZE;
+	// POR options
+	int apply_por = 0;
+	int use_cycle_proviso = 0;
 	// level of verbosity (1=print level progress)
 	int verbosity = 0;
 	// POR stubborn set heuristic function
@@ -1627,11 +1634,26 @@ int main(int argc, char** argv) {
 		else if (!strcmp(argv[i],"-d")) {
 			// check for deadlocks
 			check_property = DEADLOCK;
+			use_cycle_proviso = 0;
 			i += 1;
 		}
 		else if (!strcmp(argv[i],"-p")) {
 			// check a property
 			check_property = SAFETY;
+			use_cycle_proviso = 1;
+			i += 1;
+		}
+		else if (!strcmp(argv[i],"--por")) {
+			// apply partial-order reduction
+			apply_por = 1;
+			i += 1;
+		}
+		else if (!strcmp(argv[i],"--cycle-proviso")) {
+			// use cycle proviso
+			if (check_property == NONE) {
+				use_cycle_proviso = 1;
+			}
+			fprintf(stderr, "warning: cycle proviso is not implemented for stubborn set POR!\n");
 			i += 1;
 		}
 		else if (!strcmp(argv[i],"-h")) {
@@ -1909,6 +1931,8 @@ int main(int argc, char** argv) {
 	cudaMemcpyToSymbol(d_nbits_syncbits_offset, &nbits_syncbits_offset, sizeof(inttype));
 	cudaMemcpyToSymbol(d_kernel_iters, &kernel_iters, sizeof(inttype));
 	cudaMemcpyToSymbol(d_property, &check_property, sizeof(inttype));
+	cudaMemcpyToSymbol(d_apply_por, &apply_por, sizeof(inttype));
+	cudaMemcpyToSymbol(d_check_cycle_proviso, &use_cycle_proviso, sizeof(inttype));
 
 	// init the queue
 	init_queue<<<nblocks, nthreadsperblock>>>(d_q, q_size);
