@@ -1921,7 +1921,6 @@ int main(int argc, char** argv) {
 			if (check_property == NONE) {
 				use_cycle_proviso = 1;
 			}
-			fprintf(stderr, "warning: cycle proviso is not implemented for stubborn set POR!\n");
 			i += 1;
 		}
 		else if (!strcmp(argv[i],"-h")) {
