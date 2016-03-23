@@ -1014,7 +1014,7 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		//int loopcounter = 0;
 		outtrans_enabled = 0;
 		char generate = 1;
-		char proviso_satisfied = !d_check_cycle_proviso;
+		char proviso_satisfied = 0;
 		int cluster_trans = 1 << GROUP_ID;
 		int orig_offset1 = offset1;
 		while(generate > -1) {
@@ -1061,6 +1061,11 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 												(*d_property_violation) = 1;
 											}
 										}
+									}
+
+									if (!d_check_cycle_proviso) {
+										// Set proviso to 1 to indicate at least one state has been found
+										proviso_satisfied = 1;
 									}
 									// store tgt_state in cache
 									// if k == 8, cache is full, immediately store in global hash table
@@ -1190,6 +1195,10 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 								}
 							}
 
+							if (!d_check_cycle_proviso) {
+								// Set rule_proviso to 1 to indicate at least one state has been found
+								rule_proviso = 1;
+							}
 							// store tgt_state in cache; if i == d_shared_q_size, state was found, duplicate detected
 							// if i == d_shared_q_size+1, cache is full, immediately store in global hash table
 							if(generate == 1) {
@@ -1321,24 +1330,21 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 				}
 				THREADBUFFERGROUPPOS(GROUP_ID,0) = cluster_trans;
 				__syncthreads();
-				int apply_por = 1;
 				proviso_satisfied = 0;
-				for(i = 0; i < d_nr_procs && apply_por; i++) {
-					if(GETBIT(i, cluster_trans)) {
-						// This process synchronizes with process i
-						if((cluster_trans | THREADBUFFERGROUPPOS(i,0)) == cluster_trans) {
-							// Process i's actions do not go outside our cluster
-							// Keep the POR dream alive
-							proviso_satisfied |= GETBIT(i,THREADBUFFERGROUPPOS(i,0));
-						} else {
-							// Reduction cannot be applied based on the cluster of this thread
-							apply_por = 0;
-						}
-					}
+				int to_check = cluster_trans;
+				while (to_check) {
+					i = __ffs(to_check) - 1;
+					to_check &= ~(1 << i);
+					int cluster = THREADBUFFERGROUPPOS(i, 0);
+					proviso_satisfied |= GETBIT(i, cluster);
+					to_check |= cluster & ~cluster_trans;
+					cluster_trans |= cluster;
 				}
 				__syncthreads();
-				if(!(apply_por && proviso_satisfied)) {
+				if(!proviso_satisfied) {
 					THREADBUFFERGROUPPOS(GROUP_ID,0) = 0;
+				} else {
+					THREADBUFFERGROUPPOS(GROUP_ID,0) = cluster_trans;
 				}
 				__syncthreads();
 				if(GROUP_ID == 0) {
