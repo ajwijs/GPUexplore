@@ -953,7 +953,7 @@ __device__ void compute_stubborn_set(inttype offset1, inttype offset2, inttype* 
 		if(!THREADGROUPPOR) {
 			// Cycle proviso cannot be satisfied by any stubborn set, so we return all actions
 			for (i = GROUP_ID; i < (d_por_matrix_size + 31) / 32; i+=d_nr_procs) {
-				THREADGROUPENABLED(i) = (unsigned int) -1;
+				THREADGROUPSTUBBORN(i) = (unsigned int) -1;
 			}
 			return;
 		}
