@@ -216,7 +216,7 @@ const size_t Mb = 1<<20;
 #define OTHERINT(t)								((t) & 0xBFFFFFFF)
 #define PORINT(t)								((t) | 0x40000000)
 
-#define STATE_FLAGS_MASK                        0x3FFFFFFF
+#define STATE_FLAGS_MASK                        (d_check_cycle_proviso ? 0x3FFFFFFF : 0x7FFFFFFF)
 #define STRIPSTATE(t)							{(t)[(d_sv_nints-1)] = (t)[(d_sv_nints-1)] & STATE_FLAGS_MASK;}
 #define STRIPPEDSTATE(t, i)						((i == d_sv_nints-1) ? ((t)[i] & STATE_FLAGS_MASK) : (t)[i])
 #define STRIPPEDENTRY(t, i)						((i == d_sv_nints-1) ? ((t) & STATE_FLAGS_MASK) : (t))
