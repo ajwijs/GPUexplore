@@ -849,6 +849,7 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 	inttype last_search_location = 0;
 	while (ITERATIONS < d_kernel_iters) {
 		if (threadIdx.x == 0 && OPENTILECOUNT < OPENTILELEN && d_newstate_flags[blockIdx.x]) {
+			// Indicate that we are scanning
 			d_newstate_flags[blockIdx.x] = 2;
 			SCAN = 1;
 		}
@@ -900,21 +901,19 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 				(*d_contBFS) = 1;
 			}
 			if(SCAN && WORKSCANRESULT == 0 && d_newstate_flags[blockIdx.x] == 2) {
-				// No new states were found by this block, save this information to prevent
-				// unnecessary scanning later on
+				// Scanning has completed and no new states were found by this block,
+				// save this information to prevent unnecessary scanning later on
 				d_newstate_flags[blockIdx.x] = 0;
 			} else {
 				WORKSCANRESULT = 0;
 			}
 			scan = 0;
+			OPENTILECOUNT = 0;
+			CONTINUE = 1;
 		}
 		// is the thread part of an 'active' group?
 		offset1 = 0;
 		offset2 = 0;
-		if (threadIdx.x == 0) {
-			OPENTILECOUNT = 0;
-		}
-		__syncthreads();
 		if (THREADINGROUP) {
 			act = 1 << d_bits_act;
 			for (i = 0; i < d_max_buf_ints; i++) {
@@ -926,8 +925,6 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 				i = tex1Dfetch(tex_proc_offsets_start, GROUP_ID);
 				// Determine process state
 				GETSTATEVECTORSTATE(cont, src_state, GROUP_ID);
-				// TODO: remove
-				TMPVAR = cont;
 				// Offset position
 				index = cont/(INTSIZE/d_nbits_offset);
 				pos = cont - (index*(INTSIZE/d_nbits_offset));
@@ -950,9 +947,6 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		// iterate over the outgoing transitions of state 'cont'
 		// variable cont is reused to indicate whether the buffer content of this thread still needs processing
 		cont = 0;
-		if (threadIdx.x == 0) {
-			CONTINUE = 1;
-		}
 		__syncthreads();
 		// while there is work to be done
 		//int loopcounter = 0;
@@ -1266,10 +1260,6 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 			if (THREADINGROUP && GROUP_ID == 0) {
 				THREADGROUPCOUNTER = 1 << d_bits_act;
 			}
-			// FOR TEST PURPOSES!
-//			if (threadIdx.x == 0) {
-//				CONTINUE++;
-//			}
 			__syncthreads();
 		} // END WHILE CONTINUE == 1
 		// have we encountered a deadlock state?
