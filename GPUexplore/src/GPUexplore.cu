@@ -944,13 +944,13 @@ __device__ void compute_stubborn_set(inttype offset1, inttype offset2, inttype* 
 
 	// check whether set of states satisfying proviso is empty
 	if (d_check_cycle_proviso) {
-		for (i = GROUP_ID; i < (d_por_matrix_size + 31) / 32; i+=d_nr_procs) {
+		for (i = GROUP_ID; THREADINGROUP && i < (d_por_matrix_size + 31) / 32; i+=d_nr_procs) {
 			if(THREADGROUPPROVISO(i)) {
 				THREADGROUPPOR = 1;
 			}
 		}
 		__syncthreads();
-		if(!THREADGROUPPOR) {
+		if(!THREADGROUPPOR && THREADINGROUP) {
 			// Cycle proviso cannot be satisfied by any stubborn set, so we return all actions
 			for (i = GROUP_ID; i < (d_por_matrix_size + 31) / 32; i+=d_nr_procs) {
 				THREADGROUPSTUBBORN(i) = (unsigned int) -1;
