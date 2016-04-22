@@ -1337,7 +1337,7 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 					to_check &= ~(1 << i);
 					int cluster = THREADBUFFERGROUPPOS(i, 0);
 					proviso_satisfied |= GETBIT(i, cluster);
-					to_check |= cluster & ~cluster_trans;
+					to_check |= cluster & ~cluster_trans & ~(1 << i);
 					cluster_trans |= cluster;
 				}
 				__syncthreads();
