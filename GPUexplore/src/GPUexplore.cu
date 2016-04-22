@@ -908,7 +908,6 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 				WORKSCANRESULT = 0;
 			}
 			scan = 0;
-			OPENTILECOUNT = 0;
 			CONTINUE = 1;
 		}
 		// is the thread part of an 'active' group?
@@ -1282,6 +1281,8 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 				}
 			}
 		}
+		int performed_work = OPENTILECOUNT != 0;
+		__syncthreads();
 		// Reset the open queue tile
 		if (threadIdx.x < OPENTILELEN) {
 			shared[OPENTILEOFFSET+threadIdx.x] = EMPTYVECT32;
@@ -1293,7 +1294,7 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		// start scanning the local cache and write results to the global hash table
 		k = (d_shared_q_size-CACHEOFFSET)/d_sv_nints;
 		int c;
-		for (i = WARP_ID; i * WARPSIZE < k; i += (blockDim.x / WARPSIZE)) {
+		for (i = WARP_ID; performed_work && i * WARPSIZE < k; i += (blockDim.x / WARPSIZE)) {
 			int have_new_state = i * WARPSIZE + LANE < k && ISNEWSTATE(&shared[CACHEOFFSET+(i*WARPSIZE+LANE)*d_sv_nints]);
 			while (c = __ballot(have_new_state)) {
 				int active_lane = __ffs(c) - 1;
