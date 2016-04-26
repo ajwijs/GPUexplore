@@ -208,20 +208,21 @@ const size_t Mb = 1<<20;
 													bitmask = 0; SETBITS(0,(i),bitmask); if ((t & bitmask) > 0) {(a) = 0;} else {(a) = 1;}} \
 													else {(a) = 0;}}
 #define GETSYNCRULE(a, t, i)					{bitmask = 0; SETBITS((i)*d_nr_procs,((i)+1)*d_nr_procs,bitmask); (a) = ((t) & bitmask) >> ((i)*d_nr_procs);}
-#define SYNCRULEISAPPLICABLE(a, t, ac)			{(a) = 1; for (bk = 0; bk < d_nr_procs; bk++) { \
-													if (GETBIT(bk,(t))) { \
-														bj = THREADBUFFERGROUPPOS((inttype) bk,0); \
-														if (bj == 0) { \
+#define SYNCRULEISAPPLICABLE(a, t, ac)			{(a) = 1; \
+												 for (int rule = (t); rule;) { \
+													bk = __ffs(rule) - 1; \
+													bj = THREADBUFFERGROUPPOS((inttype) bk,0); \
+													if (bj == 0) { \
+														(a) = 0; \
+													} \
+													else { \
+														GETPROCTRANSACT(k, bj); \
+														if (k != (ac)) { \
 															(a) = 0; \
 														} \
-														else { \
-															GETPROCTRANSACT(k, bj); \
-															if (k != (ac)) { \
-																(a) = 0; \
-															} \
-														}\
-													} \
-												} \
+													}\
+													rule &= ~(1 << bk); \
+												 } \
 												}
 
 // HASH TABLE MACROS
@@ -1154,12 +1155,12 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 								tgt_state[pos] = src_state[pos];
 							}
 							// construct first successor
-							for (pos = 0; pos < d_nr_procs; pos++) {
-								if (GETBIT(pos, tmp)) {
-									// get first state
-									GETPROCTRANSSTATE(k, THREADBUFFERGROUPPOS(pos,0), 1, pos);
-									SETSTATEVECTORSTATE(tgt_state, pos, k-1);
-								}
+							for (int rule = tmp; rule;) {
+								pos = __ffs(rule) - 1;
+								// get first state
+								GETPROCTRANSSTATE(k, THREADBUFFERGROUPPOS(pos,0), 1, pos);
+								SETSTATEVECTORSTATE(tgt_state, pos, k-1);
+								rule &= ~(1 << pos);
 							}
 							SETNEWSTATE(tgt_state);
 							// while we keep getting new states, store them
@@ -1184,52 +1185,53 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 									}
 								}
 								// get next successor
-								for (pos = d_nr_procs-1; pos >= 0; pos--) {
-									if (GETBIT(pos,tmp)) {
-										int curr_st;
-										GETSTATEVECTORSTATE(curr_st, tgt_state, pos);
-										int st = 0;
-										for (k = 0; k < d_max_buf_ints; k++) {
-											for (l = 1; l <= NR_OF_STATES_IN_TRANSENTRY(pos); l++) {
-												GETPROCTRANSSTATE(st, THREADBUFFERGROUPPOS(pos,k), l, pos);
-												if (curr_st == (st-1)) {
-													break;
-												}
-											}
+								int rule;
+								for (rule = tmp; rule;) {
+									pos = __ffs(rule) - 1;
+									int curr_st;
+									GETSTATEVECTORSTATE(curr_st, tgt_state, pos);
+									int st = 0;
+									for (k = 0; k < d_max_buf_ints; k++) {
+										for (l = 1; l <= NR_OF_STATES_IN_TRANSENTRY(pos); l++) {
+											GETPROCTRANSSTATE(st, THREADBUFFERGROUPPOS(pos,k), l, pos);
 											if (curr_st == (st-1)) {
 												break;
 											}
 										}
-										// Assumption: element has been found (otherwise, 'last' was not a valid successor)
-										// Try to get the next element
-										if (l == NR_OF_STATES_IN_TRANSENTRY(pos)) {
-											if (k >= d_max_buf_ints-1) {
-												st = 0;
-											}
-											else {
-												k++;
-												l = 1;
-											}
+										if (curr_st == (st-1)) {
+											break;
+										}
+									}
+									// Assumption: element has been found (otherwise, 'last' was not a valid successor)
+									// Try to get the next element
+									if (l == NR_OF_STATES_IN_TRANSENTRY(pos)) {
+										if (k >= d_max_buf_ints-1) {
+											st = 0;
 										}
 										else {
-											l++;
+											k++;
+											l = 1;
 										}
-										// Retrieve next element, insert it in 'tgt_state' if it is not 0, and return result, otherwise continue
-										if (st != 0) {
-											GETPROCTRANSSTATE(st, THREADBUFFERGROUPPOS(pos,k), l, pos);
-											if (st > 0) {
-												SETSTATEVECTORSTATE(tgt_state, pos, st-1);
-												SETNEWSTATE(tgt_state);
-												break;
-											}
-										}
-										// else, set this process state to first one, and continue to next process
-										GETPROCTRANSSTATE(st, THREADBUFFERGROUPPOS(pos,0), 1, pos);
-										SETSTATEVECTORSTATE(tgt_state, pos, st-1);
 									}
+									else {
+										l++;
+									}
+									// Retrieve next element, insert it in 'tgt_state' if it is not 0, and return result, otherwise continue
+									if (st != 0) {
+										GETPROCTRANSSTATE(st, THREADBUFFERGROUPPOS(pos,k), l, pos);
+										if (st > 0) {
+											SETSTATEVECTORSTATE(tgt_state, pos, st-1);
+											SETNEWSTATE(tgt_state);
+											break;
+										}
+									}
+									// else, set this process state to first one, and continue to next process
+									GETPROCTRANSSTATE(st, THREADBUFFERGROUPPOS(pos,0), 1, pos);
+									SETSTATEVECTORSTATE(tgt_state, pos, st-1);
+									rule &= ~(1 << pos);
 								}
 								// did we find a successor? if not, set tgt_state to old
-								if (pos == -1) {
+								if (rule == 0) {
 									SETOLDSTATE(tgt_state);
 								}
 							}
