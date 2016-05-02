@@ -209,18 +209,10 @@ const size_t Mb = 1<<20;
 													else {(a) = 0;}}
 #define GETSYNCRULE(a, t, i)					{bitmask = 0; SETBITS((i)*d_nr_procs,((i)+1)*d_nr_procs,bitmask); (a) = ((t) & bitmask) >> ((i)*d_nr_procs);}
 #define SYNCRULEISAPPLICABLE(a, t, ac)			{(a) = 1; \
-												 for (int rule = (t); rule;) { \
+												 for (int rule = (t); rule && a;) { \
 													bk = __ffs(rule) - 1; \
 													bj = THREADBUFFERGROUPPOS((inttype) bk,0); \
-													if (bj == 0) { \
-														(a) = 0; \
-													} \
-													else { \
-														GETPROCTRANSACT(k, bj); \
-														if (k != (ac)) { \
-															(a) = 0; \
-														} \
-													}\
+													(a) = bj == 0 ? 0 : ((bj >> 1) & ((1 << d_bits_act) - 1)) == (ac); \
 													rule &= ~(1 << bk); \
 												 } \
 												}
