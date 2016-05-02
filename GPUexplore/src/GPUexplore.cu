@@ -315,7 +315,6 @@ __device__ inttype STOREINCACHE(inttype* t, inttype* d_q, inttype* address) {
 
 // check if bucket element associated with lane is a valid position to store data
 #define LANEPOINTSTOVALIDBUCKETPOS						(HALFLANE < ((HALFWARPSIZE / d_sv_nints)*d_sv_nints))
-//#define LANEPOINTSTOVALIDBUCKETPOS						true
 
 __device__ inttype LANE_POINTS_TO_EL(inttype i)	{
 	if (i < HALFWARPSIZE / d_sv_nints) {
@@ -326,15 +325,9 @@ __device__ inttype LANE_POINTS_TO_EL(inttype i)	{
 	}
 }
 
-//__device__ inttype LANE_POINTS_TO_EL(inttype i)	{
-//	return (LANE >= i*d_sv_nints && LANE < (i+1)*d_sv_nints);
-//}
-
 // start position of element i in bucket
 #define STARTPOS_OF_EL_IN_BUCKET(i)			((i < (HALFWARPSIZE / d_sv_nints)) ? (i*d_sv_nints) : (HALFWARPSIZE + (i-(HALFWARPSIZE/d_sv_nints))*d_sv_nints))
-//#define STARTPOS_OF_EL_IN_BUCKET(i)			(i*d_sv_nints)
 #define STARTPOS_OF_EL_IN_BUCKET_HOST(i)	((i < (HALFWARPSIZE / sv_nints)) ? (i*sv_nints) : (HALFWARPSIZE + (i-(HALFWARPSIZE/sv_nints))*sv_nints))
-//#define STARTPOS_OF_EL_IN_BUCKET_HOST(i)	(i*sv_nints)
 
 // find or put element, single thread version.
 __device__ inttype FINDORPUT_SINGLE(inttype* t, inttype* d_q, volatile inttype* d_newstate_flags) {
@@ -353,13 +346,13 @@ __device__ inttype FINDORPUT_SINGLE(inttype* t, inttype* d_q, volatile inttype* 
 							d_q[hashtmp+STARTPOS_OF_EL_IN_BUCKET(bj)+bk] = t[bk];
 						}
 					}
-					threadfence();
+					__threadfence();
 					// There is work available for some block
 					d_newstate_flags[(hashtmp / blockDim.x) % gridDim.x] = 1;
 				}
 			}
 			if (bl != EMPTYVECT32) {
-				COMPAREVECTORS(bk, &d_q[hashtmp+STARTPOS_OF_EL_IN_BUCKET(bj)], t); \
+				COMPAREVECTORS(bk, &d_q[hashtmp+STARTPOS_OF_EL_IN_BUCKET(bj)], t);
 				if (bk == 1) {
 					// Found state in global memory
 					return 1;
@@ -505,62 +498,6 @@ __device__ inttype FIND_WARP(inttype* t, inttype* d_q)	{
 	return 0;
 }
 
-__device__ inttype FINDORPUT_WARP_ORIG(inttype* t, inttype* d_q, inttype bi, inttype bj, inttype bk, inttype bl, inttype bitmask, indextype hashtmp) {
-	for (bi = 0; bi < NR_HASH_FUNCTIONS; bi++) {
-		HASHFUNCTION(hashtmp, bi, t);
-		bl = d_q[hashtmp+LANE];
-		if (ENTRY_ID == (d_sv_nints-1)) {
-			if (bl != EMPTYVECT32) {
-				COMPAREVECTORS(bl, &d_q[hashtmp+LANE-(d_sv_nints-1)], (t));
-				if (bl) {
-					SETOLDSTATE((t));
-				}
-			}
-		}
-		if (ISNEWSTATE(t)) {
-			for (bj = 0; bj < NREL_IN_BUCKET; bj++) {
-				if (d_q[hashtmp+STARTPOS_OF_EL_IN_BUCKET(bj)+(d_sv_nints-1)] == EMPTYVECT32) {
-					if (LANE == 0) {
-						bl = atomicCAS(&d_q[hashtmp+STARTPOS_OF_EL_IN_BUCKET(bj)+(d_sv_nints-1)], EMPTYVECT32, t[d_sv_nints-1]);
-						if (bl == EMPTYVECT32) {
-							SETOLDSTATE(t);
-							shared[THREADBUFFEROFFSET+WARP_ID] = OPENTILELEN;
-							if (ITERATIONS < d_kernel_iters-1) {
-								bk = atomicAdd((inttype *) &OPENTILECOUNT, d_sv_nints);
-								if (bk < OPENTILELEN) {
-									shared[THREADBUFFEROFFSET+WARP_ID] = bk;
-									d_q[hashtmp+STARTPOS_OF_EL_IN_BUCKET(bj)+(d_sv_nints-1)] = t[d_sv_nints-1];
-								}
-							}
-						}
-					}
-					if (!ISNEWSTATE(t)) {
-						if (LANE < d_sv_nints - 1) {
-							d_q[hashtmp+STARTPOS_OF_EL_IN_BUCKET(bj)+LANE] = t[LANE];
-						}
-						bk = shared[THREADBUFFEROFFSET+WARP_ID];
-						if (bk != OPENTILELEN) {
-							if (LANE < d_sv_nints) {
-								shared[OPENTILEOFFSET+bk+LANE] = NEWSTATEPART(t, LANE);
-							}
-							if (LANE == 0) {
-								shared[THREADBUFFEROFFSET+WARP_ID] = 0;
-							}
-						}
-					}
-				}
-				if (!ISNEWSTATE((t))) {
-					return 1;
-				}
-			}
-		}
-		if (!ISNEWSTATE((t))) {
-			return 1;
-		}
-	}
-	return 0;
-}
-
 // macro to print state vector
 #define PRINTVECTOR(s) 							{	printf ("("); \
 													for (bk = 0; bk < d_nr_procs; bk++) { \
@@ -573,9 +510,6 @@ __device__ inttype FINDORPUT_WARP_ORIG(inttype* t, inttype* d_q, inttype bi, int
 													printf (")\n"); \
 												}
 
-
-//#define INCRSTATEVECTOR(t)						(sv_nints == 1 ? t[0]++ : (t[0] == EMPTYVECTOR ? t[1]++ : t[0]++))
-//#define DECRSTATEVECTOR(t)						(sv_nints == 1 ? t[0]-- : (t[0] == 0 ? (t[1]--; t[0] = EMPTYVECTOR) : t[0]--))
 
 int vmem = 0;
 
@@ -671,14 +605,10 @@ void print_local_queue(FILE* stream, inttype *q, inttype q_size, inttype *firstb
 			if (q[(i*WARPSIZE)+STARTPOS_OF_EL_IN_BUCKET_HOST(j)+(sv_nints-1)] != EMPTYVECT32) {
 				count++;
 
-//				if (j == 0) {
-//					fprintf (stdout, "-----------\n");
-//				}
 				nw = ISNEWSTATE_HOST(&q[(i*WARPSIZE)+STARTPOS_OF_EL_IN_BUCKET_HOST(j)]);
 				if (nw) {
 					newcount++;
 					fprintf (stream, "new: ");
-					//print_statevector(&(q[(i*WARPSIZE)+(j*sv_nints)]), firstbit_statevector, nr_procs);
 				}
 				print_statevector(stream, &(q[(i*WARPSIZE)+STARTPOS_OF_EL_IN_BUCKET_HOST(j)]), firstbit_statevector, nr_procs, sv_nints);
 			}
@@ -942,7 +872,6 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		cont = 0;
 		__syncthreads();
 		// while there is work to be done
-		//int loopcounter = 0;
 		outtrans_enabled = 0;
 		local_action_counter = 0;
 		while (CONTINUE == 1) {
