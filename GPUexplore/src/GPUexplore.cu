@@ -1,9 +1,9 @@
 /*
  ============================================================================
  Name        : GPUexplore.cu
- Author      : Anton Wijs
+ Author      : Anton Wijs and Thomas Neele
  Version     :
- Copyright   : Copyright Anton Wijs
+ Copyright   : Copyright Anton Wijs and Thomas Neele
  Description : CUDA GPUexplore: On the fly state space analysis
  ============================================================================
  */
