@@ -235,6 +235,7 @@ __device__ inttype STOREINCACHE(inttype* t, inttype* d_q, inttype* address) {
 	hashtmp = 0;
 	for (bi = 0; bi < d_sv_nints; bi++) {
 		hashtmp += t[bi];
+		hashtmp <<= 5;
 	}
 	bitmask = d_sv_nints*((inttype) (hashtmp % ((d_shared_q_size - CACHEOFFSET) / d_sv_nints)));
 	SETNEWSTATE(t);
