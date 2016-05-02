@@ -1,9 +1,9 @@
 /*
  ============================================================================
  Name        : GPUexplore.cu
- Author      : Anton Wijs
+ Author      : Anton Wijs and Thomas Neele
  Version     :
- Copyright   : Copyright Anton Wijs
+ Copyright   : Copyright Anton Wijs and Thomas Neele
  Description : CUDA GPUexplore: On the fly state space analysis
  ============================================================================
  */
@@ -227,20 +227,13 @@ const size_t Mb = 1<<20;
 													bitmask = 0; SETBITS(0,(i),bitmask); if ((t & bitmask) > 0) {(a) = 0;} else {(a) = 1;}} \
 													else {(a) = 0;}}
 #define GETSYNCRULE(a, t, i)					{bitmask = 0; SETBITS((i)*d_nr_procs,((i)+1)*d_nr_procs,bitmask); (a) = ((t) & bitmask) >> ((i)*d_nr_procs);}
-#define SYNCRULEISAPPLICABLE(a, t, ac)			{(a) = 1; for (bk = 0; bk < d_nr_procs; bk++) { \
-													if (GETBIT(bk,(t))) { \
-														bj = THREADBUFFERGROUPPOS((inttype) bk,0); \
-														if (bj == 0) { \
-															(a) = 0; \
-														} \
-														else { \
-															GETPROCTRANSACT(k, bj); \
-															if (k != (ac)) { \
-																(a) = 0; \
-															} \
-														}\
-													} \
-												} \
+#define SYNCRULEISAPPLICABLE(a, t, ac)			{(a) = 1; \
+												 for (int rule = (t); rule && a;) { \
+													bk = __ffs(rule) - 1; \
+													bj = THREADBUFFERGROUPPOS((inttype) bk,0); \
+													(a) = bj == 0 ? 0 : ((bj >> 1) & ((1 << d_bits_act) - 1)) == (ac); \
+													rule &= ~(1 << bk); \
+												 } \
 												}
 
 // HASH TABLE MACROS
@@ -253,6 +246,7 @@ __device__ inttype STOREINCACHE(inttype* t, inttype* d_q, inttype* address) {
 	hashtmp = 0;
 	for (bi = 0; bi < d_sv_nints; bi++) {
 		hashtmp += t[bi];
+		hashtmp <<= 5;
 	}
 	bitmask = d_sv_nints*((inttype) (hashtmp % ((d_shared_q_size - CACHEOFFSET) / d_sv_nints)));
 	SETNEWSTATE(t);
@@ -378,7 +372,6 @@ __device__ void MARKINCACHE(inttype* t, inttype* d_q, int markNew) {
 
 // check if bucket element associated with lane is a valid position to store data
 #define LANEPOINTSTOVALIDBUCKETPOS						(HALFLANE < ((HALFWARPSIZE / d_sv_nints)*d_sv_nints))
-//#define LANEPOINTSTOVALIDBUCKETPOS						true
 
 __device__ inttype LANE_POINTS_TO_EL(inttype i)	{
 	if (i < HALFWARPSIZE / d_sv_nints) {
@@ -389,15 +382,9 @@ __device__ inttype LANE_POINTS_TO_EL(inttype i)	{
 	}
 }
 
-//__device__ inttype LANE_POINTS_TO_EL(inttype i)	{
-//	return (LANE >= i*d_sv_nints && LANE < (i+1)*d_sv_nints);
-//}
-
 // start position of element i in bucket
 #define STARTPOS_OF_EL_IN_BUCKET(i)			((i < (HALFWARPSIZE / d_sv_nints)) ? (i*d_sv_nints) : (HALFWARPSIZE + (i-(HALFWARPSIZE/d_sv_nints))*d_sv_nints))
-//#define STARTPOS_OF_EL_IN_BUCKET(i)			(i*d_sv_nints)
 #define STARTPOS_OF_EL_IN_BUCKET_HOST(i)	((i < (HALFWARPSIZE / sv_nints)) ? (i*sv_nints) : (HALFWARPSIZE + (i-(HALFWARPSIZE/sv_nints))*sv_nints))
-//#define STARTPOS_OF_EL_IN_BUCKET_HOST(i)	(i*sv_nints)
 
 // find or put element, single thread version.
 __device__ inttype FINDORPUT_SINGLE(inttype* t, inttype* d_q, volatile inttype* d_newstate_flags) {
@@ -416,13 +403,13 @@ __device__ inttype FINDORPUT_SINGLE(inttype* t, inttype* d_q, volatile inttype* 
 							d_q[hashtmp+STARTPOS_OF_EL_IN_BUCKET(bj)+bk] = t[bk];
 						}
 					}
-					threadfence();
+					__threadfence();
 					// There is work available for some block
 					d_newstate_flags[(hashtmp / blockDim.x) % gridDim.x] = 1;
 				}
 			}
 			if (bl != EMPTYVECT32) {
-				COMPAREVECTORS(bk, &d_q[hashtmp+STARTPOS_OF_EL_IN_BUCKET(bj)], t); \
+				COMPAREVECTORS(bk, &d_q[hashtmp+STARTPOS_OF_EL_IN_BUCKET(bj)], t);
 				if (bk == 1) {
 					// Found state in global memory
 					return 1;
@@ -578,62 +565,6 @@ __device__ inttype FIND_WARP(inttype* t, inttype* d_q)	{
 	return 0;
 }
 
-__device__ inttype FINDORPUT_WARP_ORIG(inttype* t, inttype* d_q, inttype bi, inttype bj, inttype bk, inttype bl, inttype bitmask, indextype hashtmp) {
-	for (bi = 0; bi < NR_HASH_FUNCTIONS; bi++) {
-		HASHFUNCTION(hashtmp, bi, t);
-		bl = d_q[hashtmp+LANE];
-		if (ENTRY_ID == (d_sv_nints-1)) {
-			if (bl != EMPTYVECT32) {
-				COMPAREVECTORS(bl, &d_q[hashtmp+LANE-(d_sv_nints-1)], (t));
-				if (bl) {
-					SETOLDSTATE((t));
-				}
-			}
-		}
-		if (ISNEWSTATE(t)) {
-			for (bj = 0; bj < NREL_IN_BUCKET; bj++) {
-				if (d_q[hashtmp+STARTPOS_OF_EL_IN_BUCKET(bj)+(d_sv_nints-1)] == EMPTYVECT32) {
-					if (LANE == 0) {
-						bl = atomicCAS(&d_q[hashtmp+STARTPOS_OF_EL_IN_BUCKET(bj)+(d_sv_nints-1)], EMPTYVECT32, t[d_sv_nints-1]);
-						if (bl == EMPTYVECT32) {
-							SETOLDSTATE(t);
-							shared[THREADBUFFEROFFSET+WARP_ID] = OPENTILELEN;
-							if (ITERATIONS < d_kernel_iters-1) {
-								bk = atomicAdd((inttype *) &OPENTILECOUNT, d_sv_nints);
-								if (bk < OPENTILELEN) {
-									shared[THREADBUFFEROFFSET+WARP_ID] = bk;
-									d_q[hashtmp+STARTPOS_OF_EL_IN_BUCKET(bj)+(d_sv_nints-1)] = t[d_sv_nints-1];
-								}
-							}
-						}
-					}
-					if (!ISNEWSTATE(t)) {
-						if (LANE < d_sv_nints - 1) {
-							d_q[hashtmp+STARTPOS_OF_EL_IN_BUCKET(bj)+LANE] = t[LANE];
-						}
-						bk = shared[THREADBUFFEROFFSET+WARP_ID];
-						if (bk != OPENTILELEN) {
-							if (LANE < d_sv_nints) {
-								shared[OPENTILEOFFSET+bk+LANE] = NEWSTATEPART(t, LANE);
-							}
-							if (LANE == 0) {
-								shared[THREADBUFFEROFFSET+WARP_ID] = 0;
-							}
-						}
-					}
-				}
-				if (!ISNEWSTATE((t))) {
-					return 1;
-				}
-			}
-		}
-		if (!ISNEWSTATE((t))) {
-			return 1;
-		}
-	}
-	return 0;
-}
-
 // macro to print state vector
 #define PRINTVECTOR(s) 							{	printf ("("); \
 													for (bk = 0; bk < d_nr_procs; bk++) { \
@@ -646,9 +577,6 @@ __device__ inttype FINDORPUT_WARP_ORIG(inttype* t, inttype* d_q, inttype bi, int
 													printf (")\n"); \
 												}
 
-
-//#define INCRSTATEVECTOR(t)						(sv_nints == 1 ? t[0]++ : (t[0] == EMPTYVECTOR ? t[1]++ : t[0]++))
-//#define DECRSTATEVECTOR(t)						(sv_nints == 1 ? t[0]-- : (t[0] == 0 ? (t[1]--; t[0] = EMPTYVECTOR) : t[0]--))
 
 int vmem = 0;
 
@@ -1196,14 +1124,10 @@ void print_local_queue(FILE* stream, inttype *q, inttype q_size, inttype *firstb
 			if (q[(i*WARPSIZE)+STARTPOS_OF_EL_IN_BUCKET_HOST(j)+(sv_nints-1)] != EMPTYVECT32) {
 				count++;
 
-//				if (j == 0) {
-//					fprintf (stdout, "-----------\n");
-//				}
 				nw = ISNEWSTATE_HOST(&q[(i*WARPSIZE)+STARTPOS_OF_EL_IN_BUCKET_HOST(j)]);
 				if (nw) {
 					newcount++;
 					fprintf (stream, "new: ");
-					//print_statevector(&(q[(i*WARPSIZE)+(j*sv_nints)]), firstbit_statevector, nr_procs);
 				}
 				print_statevector(stream, &(q[(i*WARPSIZE)+STARTPOS_OF_EL_IN_BUCKET_HOST(j)]), firstbit_statevector, nr_procs, sv_nints);
 			}
@@ -1367,6 +1291,7 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 	inttype last_search_location = 0;
 	while (ITERATIONS < d_kernel_iters) {
 		if (threadIdx.x == 0 && OPENTILECOUNT < OPENTILELEN && d_newstate_flags[blockIdx.x]) {
+			// Indicate that we are scanning
 			d_newstate_flags[blockIdx.x] = 2;
 			SCAN = 1;
 		}
@@ -1418,21 +1343,18 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 				(*d_contBFS) = 1;
 			}
 			if(SCAN && WORKSCANRESULT == 0 && d_newstate_flags[blockIdx.x] == 2) {
-				// No new states were found by this block, save this information to prevent
-				// unnecessary scanning later on
+				// Scanning has completed and no new states were found by this block,
+				// save this information to prevent unnecessary scanning later on
 				d_newstate_flags[blockIdx.x] = 0;
 			} else {
 				WORKSCANRESULT = 0;
 			}
 			scan = 0;
+			CONTINUE = 1;
 		}
 		// is the thread part of an 'active' group?
 		offset1 = 0;
 		offset2 = 0;
-		if (threadIdx.x == 0) {
-			OPENTILECOUNT = 0;
-		}
-		__syncthreads();
 		if (THREADINGROUP) {
 			act = 1 << d_bits_act;
 			for (i = 0; i < d_max_buf_ints; i++) {
@@ -1444,8 +1366,6 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 				i = tex1Dfetch(tex_proc_offsets_start, GROUP_ID);
 				// Determine process state
 				GETSTATEVECTORSTATE(cont, src_state, GROUP_ID);
-				// TODO: remove
-				TMPVAR = cont;
 				// Offset position
 				index = cont/(INTSIZE/d_nbits_offset);
 				pos = cont - (index*(INTSIZE/d_nbits_offset));
@@ -1473,9 +1393,6 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		// iterate over the outgoing transitions of state 'cont'
 		// variable cont is reused to indicate whether the buffer content of this thread still needs processing
 		cont = 0;
-		if (threadIdx.x == 0) {
-			CONTINUE = 1;
-		}
 		__syncthreads();
 		if (d_apply_por) {
 			compute_stubborn_set(offset1, offset2, d_q, d_newstate_flags);
@@ -1485,7 +1402,6 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 			__syncthreads();
 		}
 		// while there is work to be done
-		//int loopcounter = 0;
 		outtrans_enabled = 0;
 		while (CONTINUE == 1) {
 			if (offset1 < offset2 || cont) {
@@ -1624,12 +1540,12 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 								tgt_state[pos] = src_state[pos];
 							}
 							// construct first successor
-							for (pos = 0; pos < d_nr_procs; pos++) {
-								if (GETBIT(pos, tmp)) {
-									// get first state
-									GETPROCTRANSSTATE(k, THREADBUFFERGROUPPOS(pos,0), 1, pos);
-									SETSTATEVECTORSTATE(tgt_state, pos, k-1);
-								}
+							for (int rule = tmp; rule;) {
+								pos = __ffs(rule) - 1;
+								// get first state
+								GETPROCTRANSSTATE(k, THREADBUFFERGROUPPOS(pos,0), 1, pos);
+								SETSTATEVECTORSTATE(tgt_state, pos, k-1);
+								rule &= ~(1 << pos);
 							}
 							SETNEWSTATE(tgt_state);
 							// while we keep getting new states, store them
@@ -1663,52 +1579,53 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 									}
 								}
 								// get next successor
-								for (pos = d_nr_procs-1; pos >= 0; pos--) {
-									if (GETBIT(pos,tmp)) {
-										int curr_st;
-										GETSTATEVECTORSTATE(curr_st, tgt_state, pos);
-										int st = 0;
-										for (k = 0; k < d_max_buf_ints; k++) {
-											for (l = 1; l <= NR_OF_STATES_IN_TRANSENTRY(pos); l++) {
-												GETPROCTRANSSTATE(st, THREADBUFFERGROUPPOS(pos,k), l, pos);
-												if (curr_st == (st-1)) {
-													break;
-												}
-											}
+								int rule;
+								for (rule = tmp; rule;) {
+									pos = __ffs(rule) - 1;
+									int curr_st;
+									GETSTATEVECTORSTATE(curr_st, tgt_state, pos);
+									int st = 0;
+									for (k = 0; k < d_max_buf_ints; k++) {
+										for (l = 1; l <= NR_OF_STATES_IN_TRANSENTRY(pos); l++) {
+											GETPROCTRANSSTATE(st, THREADBUFFERGROUPPOS(pos,k), l, pos);
 											if (curr_st == (st-1)) {
 												break;
 											}
 										}
-										// Assumption: element has been found (otherwise, 'last' was not a valid successor)
-										// Try to get the next element
-										if (l == NR_OF_STATES_IN_TRANSENTRY(pos)) {
-											if (k >= d_max_buf_ints-1) {
-												st = 0;
-											}
-											else {
-												k++;
-												l = 1;
-											}
+										if (curr_st == (st-1)) {
+											break;
+										}
+									}
+									// Assumption: element has been found (otherwise, 'last' was not a valid successor)
+									// Try to get the next element
+									if (l == NR_OF_STATES_IN_TRANSENTRY(pos)) {
+										if (k >= d_max_buf_ints-1) {
+											st = 0;
 										}
 										else {
-											l++;
+											k++;
+											l = 1;
 										}
-										// Retrieve next element, insert it in 'tgt_state' if it is not 0, and return result, otherwise continue
-										if (st != 0) {
-											GETPROCTRANSSTATE(st, THREADBUFFERGROUPPOS(pos,k), l, pos);
-											if (st > 0) {
-												SETSTATEVECTORSTATE(tgt_state, pos, st-1);
-												SETNEWSTATE(tgt_state);
-												break;
-											}
-										}
-										// else, set this process state to first one, and continue to next process
-										GETPROCTRANSSTATE(st, THREADBUFFERGROUPPOS(pos,0), 1, pos);
-										SETSTATEVECTORSTATE(tgt_state, pos, st-1);
 									}
+									else {
+										l++;
+									}
+									// Retrieve next element, insert it in 'tgt_state' if it is not 0, and return result, otherwise continue
+									if (st != 0) {
+										GETPROCTRANSSTATE(st, THREADBUFFERGROUPPOS(pos,k), l, pos);
+										if (st > 0) {
+											SETSTATEVECTORSTATE(tgt_state, pos, st-1);
+											SETNEWSTATE(tgt_state);
+											break;
+										}
+									}
+									// else, set this process state to first one, and continue to next process
+									GETPROCTRANSSTATE(st, THREADBUFFERGROUPPOS(pos,0), 1, pos);
+									SETSTATEVECTORSTATE(tgt_state, pos, st-1);
+									rule &= ~(1 << pos);
 								}
 								// did we find a successor? if not, set tgt_state to old
-								if (pos == -1) {
+								if (rule == 0) {
 									SETOLDSTATE(tgt_state);
 								}
 							}
@@ -1738,10 +1655,6 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 			if (THREADINGROUP && GROUP_ID == 0) {
 				THREADGROUPCOUNTER = 1 << d_bits_act;
 			}
-			// FOR TEST PURPOSES!
-//			if (threadIdx.x == 0) {
-//				CONTINUE++;
-//			}
 			__syncthreads();
 		} // END WHILE CONTINUE == 1
 		// have we encountered a deadlock state?
@@ -1764,6 +1677,8 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 				}
 			}
 		}
+		int performed_work = OPENTILECOUNT != 0;
+		__syncthreads();
 		// Reset the open queue tile
 		if (threadIdx.x < OPENTILELEN) {
 			shared[OPENTILEOFFSET+threadIdx.x] = EMPTYVECT32;
@@ -1775,7 +1690,7 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		// start scanning the local cache and write results to the global hash table
 		k = (d_shared_q_size-CACHEOFFSET)/d_sv_nints;
 		int c;
-		for (i = WARP_ID; i * WARPSIZE < k; i += (blockDim.x / WARPSIZE)) {
+		for (i = WARP_ID; performed_work && i * WARPSIZE < k; i += (blockDim.x / WARPSIZE)) {
 			int have_new_state = i * WARPSIZE + LANE < k && ISNEWSTATE(&shared[CACHEOFFSET+(i*WARPSIZE+LANE)*d_sv_nints]);
 			while (c = __ballot(have_new_state)) {
 				int active_lane = __ffs(c) - 1;
