@@ -1077,11 +1077,18 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 								tgt_state[pos] = src_state[pos];
 							}
 							// construct first successor
+							int has_second_succ = 0;
 							for (int rule = tmp; rule;) {
 								pos = __ffs(rule) - 1;
 								// get first state
 								GETPROCTRANSSTATE(k, THREADBUFFERGROUPPOS(pos,0), 1, pos);
 								SETSTATEVECTORSTATE(tgt_state, pos, k-1);
+								GETPROCTRANSSTATE(k, THREADBUFFERGROUPPOS(pos,0), 2, pos);
+								has_second_succ |= k;
+								if(d_max_buf_ints > 1 && !k) {
+									GETPROCTRANSSTATE(k, THREADBUFFERGROUPPOS(pos,1), 1, pos);
+									has_second_succ |= k;
+								}
 								rule &= ~(1 << pos);
 							}
 							SETNEWSTATE(tgt_state);
@@ -1105,6 +1112,9 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 										// ERROR! hash table too full. Set CONTINUE to 2
 										CONTINUE = 2;
 									}
+								}
+								if(!has_second_succ) {
+									break;
 								}
 								// get next successor
 								int rule;
