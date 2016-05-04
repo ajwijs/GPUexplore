@@ -113,6 +113,7 @@ const size_t Mb = 1<<20;
 #define VECTORPOSLEN					(d_nr_procs+1)
 #define LTSSTATESIZELEN					(d_nr_procs)
 #define OPENTILELEN						(d_sv_nints*NR_GROUPS)
+#define LASTSEARCHLEN					(blockDim.x/WARPSIZE)
 #define TGTSTATELEN						(blockDim.x*d_sv_nints)
 #define THREADBUFFERLEN					(NR_GROUPS*(THREADBUFFERSHARED+(d_nr_procs*d_max_buf_ints)))
 
@@ -120,7 +121,8 @@ const size_t Mb = 1<<20;
 #define VECTORPOSOFFSET 				(HASHCONSTANTSOFFSET+HASHCONSTANTSLEN)
 #define LTSSTATESIZEOFFSET 				(VECTORPOSOFFSET+VECTORPOSLEN)
 #define OPENTILEOFFSET 					(LTSSTATESIZEOFFSET+LTSSTATESIZELEN)
-#define TGTSTATEOFFSET		 			(OPENTILEOFFSET+OPENTILELEN)
+#define LASTSEARCHOFFSET				(OPENTILEOFFSET+OPENTILELEN)
+#define TGTSTATEOFFSET		 			(LASTSEARCHOFFSET+LASTSEARCHLEN)
 #define THREADBUFFEROFFSET	 			(TGTSTATEOFFSET+TGTSTATELEN)
 #define CACHEOFFSET 					(THREADBUFFEROFFSET+THREADBUFFERLEN)
 
@@ -770,7 +772,7 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 						inttype *d_firstbit_statevector, inttype *d_proc_offsets_start,
 						inttype *d_proc_offsets, inttype *d_proc_trans, inttype *d_syncbits_offsets,
 						inttype *d_syncbits, inttype *d_contBFS, inttype *d_property_violation,
-						volatile inttype *d_newstate_flags, inttype scan) {
+						volatile inttype *d_newstate_flags, inttype *d_worktiles, inttype scan) {
 	//inttype global_id = (blockIdx.x * blockDim.x) + threadIdx.x;
 	//inttype group_nr = threadIdx.x / nr_procs;
 	inttype i, k, l, index, offset1, offset2, tmp, cont, act, sync_offset1, sync_offset2;
@@ -807,7 +809,7 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		shared[i+LTSSTATESIZEOFFSET] = d_bits_state[i];
 	}
 	// Reset the open queue tile
-	if (threadIdx.x < d_sv_nints*(blockDim.x / d_nr_procs)) {
+	if (threadIdx.x < OPENTILELEN+LASTSEARCHLEN) {
 		shared[OPENTILEOFFSET+threadIdx.x] = EMPTYVECT32;
 	}
 	// Clean the cache
@@ -819,15 +821,15 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 	__syncthreads();
 	if(scan) {
 		//Copy the work tile from global mem
-		if (threadIdx.x < OPENTILELEN) {
-			shared[OPENTILEOFFSET+threadIdx.x] = d_q[d_nrbuckets*WARPSIZE + (OPENTILELEN+1) * blockIdx.x + threadIdx.x];
+		if (threadIdx.x < OPENTILELEN + LASTSEARCHLEN) {
+			shared[OPENTILEOFFSET+threadIdx.x] = d_worktiles[(OPENTILELEN+LASTSEARCHLEN+1) * blockIdx.x + threadIdx.x];
 		}
 		if(threadIdx.x == 0) {
-			OPENTILECOUNT = d_q[d_nrbuckets*WARPSIZE + (OPENTILELEN+1) * blockIdx.x + OPENTILELEN];
+			OPENTILECOUNT = d_worktiles[(OPENTILELEN+LASTSEARCHLEN+1) * blockIdx.x + OPENTILELEN + LASTSEARCHLEN];
 		}
 	}
 	__syncthreads();
-	inttype last_search_location = 0;
+	inttype last_search_location = shared[LASTSEARCHOFFSET + WARP_ID];
 	while (ITERATIONS < d_kernel_iters) {
 		if (threadIdx.x == 0 && OPENTILECOUNT < OPENTILELEN && d_newstate_flags[blockIdx.x]) {
 			// Indicate that we are scanning
@@ -870,6 +872,9 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 				last_search_location = i - GLOBAL_WARP_ID;
 			} else {
 				last_search_location = 0;
+			}
+			if(LANE == 0) {
+				shared[LASTSEARCHOFFSET + WARP_ID] = last_search_location;
 			}
 			if(found_new_state || i < d_nrbuckets) {
 				WORKSCANRESULT = 1;
@@ -1365,11 +1370,11 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 	}
 
 	//Copy the work tile to global mem
-	if (threadIdx.x < OPENTILELEN) {
-		d_q[d_nrbuckets*WARPSIZE + (OPENTILELEN+1) * blockIdx.x + threadIdx.x] = shared[OPENTILEOFFSET+threadIdx.x];
+	if (threadIdx.x < OPENTILELEN+LASTSEARCHLEN) {
+		d_worktiles[(OPENTILELEN+LASTSEARCHLEN+1) * blockIdx.x + threadIdx.x] = shared[OPENTILEOFFSET+threadIdx.x];
 	}
 	if(threadIdx.x == 0) {
-		d_q[d_nrbuckets*WARPSIZE + (OPENTILELEN+1) * blockIdx.x + OPENTILELEN] = OPENTILECOUNT;
+		d_worktiles[(OPENTILELEN+LASTSEARCHLEN+1) * blockIdx.x + OPENTILELEN+LASTSEARCHLEN] = OPENTILECOUNT;
 	}
 }
 
@@ -1414,6 +1419,8 @@ int main(int argc, char** argv) {
 	inttype *d_newstate_flags;
 	// flag to keep track of property verification outcome
 	inttype *d_property_violation;
+	// Space to temporarily store work tiles
+	inttype *d_worktiles;
 
 	// GPU datastructures for calculation
 	inttype *d_q;
@@ -1628,6 +1635,8 @@ int main(int argc, char** argv) {
 	cudaMallocCount((void **) &d_syncbits_offsets, nr_syncbits_offsets*sizeof(inttype));
 	cudaMallocCount((void **) &d_syncbits, nr_syncbits*sizeof(inttype));
 	cudaMallocCount((void **) &d_newstate_flags, nblocks*sizeof(inttype));
+	cudaMallocCount((void **) &d_worktiles, nblocks * (sv_nints*(nthreadsperblock/nr_procs)+nthreadsperblock/WARPSIZE+1)*sizeof(inttype));
+
 
 	// Copy data to GPU
 	CUDA_CHECK_RETURN(cudaMemcpy(d_contBFS, &contBFS, sizeof(inttype), cudaMemcpyHostToDevice))
@@ -1640,6 +1649,7 @@ int main(int argc, char** argv) {
 	CUDA_CHECK_RETURN(cudaMemcpy(d_syncbits_offsets, syncbits_offsets, nr_syncbits_offsets*sizeof(inttype), cudaMemcpyHostToDevice))
 	CUDA_CHECK_RETURN(cudaMemcpy(d_syncbits, syncbits, nr_syncbits*sizeof(inttype), cudaMemcpyHostToDevice))
 	CUDA_CHECK_RETURN(cudaMemset(d_newstate_flags, 0, nblocks*sizeof(inttype)));
+	CUDA_CHECK_RETURN(cudaMemset(d_worktiles, 0, nblocks * (sv_nints*(nthreadsperblock/nr_procs)+nthreadsperblock/WARPSIZE+1)*sizeof(inttype)));
 
 	// Bind data to textures
 	cudaBindTexture(NULL, tex_proc_offsets_start, d_proc_offsets_start, (nr_procs+1)*sizeof(inttype));
@@ -1671,7 +1681,7 @@ int main(int argc, char** argv) {
 	fprintf (stdout, "nr. of blocks: %d, block size: %d, nr of kernel iterations: %d\n", nblocks, nthreadsperblock, kernel_iters);
 
 	// copy symbols
-	inttype tablesize = q_size - nblocks * (sv_nints*(nthreadsperblock/nr_procs)+1);
+	inttype tablesize = q_size;
 	inttype nrbuckets = tablesize / WARPSIZE;
 	cudaMemcpyToSymbol(d_nrbuckets, &nrbuckets, sizeof(inttype));
 	cudaMemcpyToSymbol(d_shared_q_size, &shared_q_size, sizeof(inttype));
@@ -1704,7 +1714,7 @@ int main(int argc, char** argv) {
 	while (contBFS == 1) {
 		CUDA_CHECK_RETURN(cudaMemcpy(d_contBFS, &zero, sizeof(inttype), cudaMemcpyHostToDevice))
 		gather<<<nblocks, nthreadsperblock, shared_q_size*sizeof(inttype)>>>(d_q, d_h, d_bits_state, d_firstbit_statevector, d_proc_offsets_start,
-																		d_proc_offsets, d_proc_trans, d_syncbits_offsets, d_syncbits, d_contBFS, d_property_violation, d_newstate_flags, scan);
+																		d_proc_offsets, d_proc_trans, d_syncbits_offsets, d_syncbits, d_contBFS, d_property_violation, d_newstate_flags, d_worktiles, scan);
 		// copy progress result
 		//CUDA_CHECK_RETURN(cudaGetLastError());
 		CUDA_CHECK_RETURN(cudaDeviceSynchronize());
