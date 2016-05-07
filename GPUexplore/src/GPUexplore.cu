@@ -710,6 +710,25 @@ __global__ void store_initial(inttype *d_q, inttype *d_h, inttype *d_newstate_fl
 	d_newstate_flags[(hashtmp / blockdim) % griddim] = 1;
 }
 
+__global__ void count_states(inttype *d_q, inttype *result) {
+	if(threadIdx.x == 0) {
+		shared[0] = 0;
+	}
+	__syncthreads();
+	int localResult = 0;
+	for(int i = GLOBAL_WARP_ID; i < d_nrbuckets; i += NR_WARPS) {
+		int tmp = d_q[i*WARPSIZE+LANE];
+		if (ENTRY_ID == (d_sv_nints-1) && tmp != EMPTYVECT32) {
+			localResult++;
+		}
+	}
+	atomicAdd((unsigned int*)shared, localResult);
+	__syncthreads();
+	if(threadIdx.x == 0) {
+		atomicAdd(result, shared[0]);
+	}
+}
+
 /**
  * CUDA kernel function for BFS iteration state gathering
  * Order of data in the shared queue:
@@ -1324,7 +1343,7 @@ int main(int argc, char** argv) {
 	FILE *fp;
 	inttype nr_procs, bits_act, bits_statevector, sv_nints, nr_trans, proc_nrstates, nbits_offset, max_buf_ints, nr_syncbits_offsets, nr_syncbits, nbits_syncbits_offset;
 	inttype *bits_state, *firstbit_statevector, *proc_offsets, *proc_trans, *proc_offsets_start, *syncbits_offsets, *syncbits;
-	inttype contBFS;
+	inttype contBFS, counted_states;
 	char stmp[BUFFERSIZE], fn[50];
 	// to store constants for closed set hash functions
 	int h[NR_HASH_FUNCTIONS*2];
@@ -1358,6 +1377,8 @@ int main(int argc, char** argv) {
 	inttype *d_newstate_flags;
 	// flag to keep track of property verification outcome
 	inttype *d_property_violation;
+	// Integer to store the amount of states counted in the hash table
+	inttype *d_counted_states;
 	// Space to temporarily store work tiles
 	inttype *d_worktiles;
 
@@ -1565,6 +1586,7 @@ int main(int argc, char** argv) {
 	// Allocate memory on GPU
 	cudaMallocCount((void **) &d_contBFS, sizeof(inttype));
 	cudaMallocCount((void **) &d_property_violation, sizeof(inttype));
+	cudaMallocCount((void **) &d_counted_states, sizeof(inttype));
 	cudaMallocCount((void **) &d_h, NR_HASH_FUNCTIONS*2*sizeof(inttype));
 	cudaMallocCount((void **) &d_bits_state, nr_procs*sizeof(inttype));
 	cudaMallocCount((void **) &d_firstbit_statevector, (nr_procs+1)*sizeof(inttype));
@@ -1701,7 +1723,12 @@ int main(int argc, char** argv) {
 	if (contBFS == 2) {
 		fprintf (stderr, "ERROR: problem with hash table\n");
 	}
-	count_queue(d_q, tablesize, firstbit_statevector, nr_procs, sv_nints);
+
+	CUDA_CHECK_RETURN(cudaMemset(d_counted_states, 0, sizeof(inttype)));
+	count_states<<<((int) prop.multiProcessorCount)*4, 512, 1>>>(d_q, d_counted_states);
+	CUDA_CHECK_RETURN(cudaDeviceSynchronize());
+	CUDA_CHECK_RETURN(cudaMemcpy(&counted_states, d_counted_states, sizeof(inttype), cudaMemcpyDeviceToHost));
+	fprintf (stdout, "nr. of states in hash table: %d\n", counted_states);
 
 	// Debugging functionality: print states to file
 //	FILE* fout;
@@ -1709,9 +1736,6 @@ int main(int argc, char** argv) {
 //	cudaMemcpy(q_test, d_q, tablesize*sizeof(inttype), cudaMemcpyDeviceToHost);
 //	print_local_queue(fout, q_test, tablesize, firstbit_statevector, nr_procs, sv_nints);
 //	fclose(fout);
-
-	CUDA_CHECK_RETURN(cudaDeviceSynchronize());	// Wait for the GPU launched work to complete
-	//CUDA_CHECK_RETURN(cudaGetLastError());
 
 	return 0;
 }
