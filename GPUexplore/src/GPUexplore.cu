@@ -778,9 +778,6 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		WORKSCANRESULT = 0;
 		SCAN = 0;
 	}
-	if ((blockIdx.x*blockDim.x)+threadIdx.x == 0) {
-		(*d_contBFS) = 0;
-	}
 	for (i = threadIdx.x; i < HASHCONSTANTSLEN; i += blockDim.x) {
 		shared[i+HASHCONSTANTSOFFSET] = d_h[i];
 	}
