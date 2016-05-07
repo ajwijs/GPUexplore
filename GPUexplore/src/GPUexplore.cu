@@ -59,7 +59,7 @@ __constant__ inttype d_apply_por;
 __constant__ inttype d_check_cycle_proviso;
 
 // GPU shared memory array
-extern __shared__ inttype shared[];
+extern __shared__ volatile inttype shared[];
 
 // thread ids
 #define WARP_ID							(threadIdx.x / WARPSIZE)
@@ -237,7 +237,7 @@ const size_t Mb = 1<<20;
 // HASH TABLE MACROS
 
 // Return 0 if not found, bit 2 is flag for new state, bit 3 is a flag for POR state, 8 if cache is full
-__device__ inttype STOREINCACHE(inttype* t, inttype* d_q, inttype* address) {
+__device__ inttype STOREINCACHE(volatile inttype* t, inttype* d_q, inttype* address) {
 	inttype bi, bj, bk, bl, bitmask;
 	indextype hashtmp;
 	STRIPSTATE(t);
@@ -296,7 +296,7 @@ __device__ inttype STOREINCACHE(inttype* t, inttype* d_q, inttype* address) {
 
 // Mark the state in the cache according to markNew
 // This function takes POR bit into account
-__device__ void MARKINCACHE(inttype* t, inttype* d_q, int markNew) {
+__device__ void MARKINCACHE(volatile inttype* t, inttype* d_q, int markNew) {
 	inttype bi, bj, bl, bitmask;
 	indextype hashtmp;
 	STRIPSTATE(t);
@@ -739,9 +739,9 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 	//inttype global_id = (blockIdx.x * blockDim.x) + threadIdx.x;
 	//inttype group_nr = threadIdx.x / nr_procs;
 	inttype i, k, l, index, offset1, offset2, tmp, cont, act, sync_offset1, sync_offset2;
-	inttype* src_state = &shared[OPENTILEOFFSET+d_sv_nints*GROUP_GID];
-	inttype* tgt_state = &shared[TGTSTATEOFFSET+threadIdx.x*d_sv_nints];
-	inttype bitmask, bi, bj, bk;
+	volatile inttype* src_state = &shared[OPENTILEOFFSET+d_sv_nints*GROUP_GID];
+	volatile inttype* tgt_state = &shared[TGTSTATEOFFSET+threadIdx.x*d_sv_nints];
+	inttype bitmask, bi, bj;
 	int pos;
 	// TODO: remove this
 	inttype TMPVAR;
@@ -857,7 +857,6 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 				WORKSCANRESULT = 0;
 			}
 			scan = 0;
-			CONTINUE = 1;
 		}
 		// is the thread part of an 'active' group?
 		offset1 = 0;
@@ -887,15 +886,12 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 				}
 			}
 			if (GROUP_ID == 0) {
-				// for later, when constructing successors for this state, set action counter to maximum
-				THREADGROUPCOUNTER = (1 << d_bits_act);
 				THREADGROUPPOR = 0;
 			}
 		}
 		// iterate over the outgoing transitions of state 'cont'
 		// variable cont is reused to indicate whether the buffer content of this thread still needs processing
 		cont = 0;
-		__syncthreads();
 		// while there is work to be done
 		outtrans_enabled = 0;
 		char generate = 1;
@@ -903,7 +899,7 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		int cluster_trans = 1 << GROUP_ID;
 		int orig_offset1 = offset1;
 		while(generate > -1) {
-			while (CONTINUE == 1) {
+			while (CONTINUE != 2 && __any(offset1 < offset2 || cont)) {
 				if (offset1 < offset2 && !cont) {
 					// reset act
 					act = (1 << (d_bits_act));
@@ -1004,7 +1000,6 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 					GETPROCTRANSACT(act, tmp);
 					// store transition entry
 					THREADBUFFERGROUPPOS(GROUP_ID,i) = tmp;
-					atomicMin((unsigned int*)&THREADGROUPCOUNTER, act);
 					cont = 1;
 					i++;
 					offset1++;
@@ -1020,16 +1015,18 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 							break;
 						}
 					}
-				} else if (cont) {
-					atomicMin((unsigned int*)&THREADGROUPCOUNTER, act);
 				}
-				__syncthreads();
+				int sync_act = cont ? act : (1 << d_bits_act);
+				for(i = 1; i < d_nr_procs; i<<=1) {
+					sync_act = min(__shfl(sync_act, GTL((GROUP_ID + i) % d_nr_procs)), sync_act);
+				}
 				// Now, we have obtained the info needed to combine process transitions
 				sync_offset1 = sync_offset2 = 0;
-				if(THREADINGROUP && THREADGROUPCOUNTER < (1 << d_bits_act)) {
+				int proc_enabled = (__ballot(act == sync_act) >> (LANE - GROUP_ID)) & ((1 << d_nr_procs) - 1);
+				if(THREADINGROUP && sync_act < (1 << d_bits_act) && (generate == 1 || __popc(proc_enabled) >= 2)) {
 					// syncbits Offset position
-					i = THREADGROUPCOUNTER/(INTSIZE/d_nbits_syncbits_offset);
-					pos = THREADGROUPCOUNTER - (i*(INTSIZE/d_nbits_syncbits_offset));
+					i = sync_act/(INTSIZE/d_nbits_syncbits_offset);
+					pos = sync_act - (i*(INTSIZE/d_nbits_syncbits_offset));
 					l = tex1Dfetch(tex_syncbits_offsets, i);
 					GETSYNCOFFSET(sync_offset1, l, pos);
 					if (pos == (INTSIZE/d_nbits_syncbits_offset)-1) {
@@ -1044,17 +1041,13 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 				tmp = 1;
 				for (int j = GROUP_ID;__any(sync_offset1 + j / (INTSIZE/d_nr_procs) < sync_offset2 && tmp); j+=d_nr_procs) {
 					index = 0;
-					if(THREADINGROUP && THREADGROUPCOUNTER < (1 << d_bits_act) && sync_offset1 + j / (INTSIZE/d_nr_procs) < sync_offset2 && tmp) {
+					if(THREADINGROUP && sync_act < (1 << d_bits_act) && sync_offset1 + j / (INTSIZE/d_nr_procs) < sync_offset2 && tmp) {
 						index = tex1Dfetch(tex_syncbits, sync_offset1 + j / (INTSIZE/d_nr_procs));
-					}
-					GETSYNCRULE(tmp, index, j % (INTSIZE/d_nr_procs));
-					l = 0;
-					if(tmp) {
-						SYNCRULEISAPPLICABLE(l, tmp, THREADGROUPCOUNTER);
 					}
 					SETOLDSTATE(tgt_state);
 					int has_second_succ = 0;
-					if (l) {
+					GETSYNCRULE(tmp, index, j % (INTSIZE/d_nr_procs));
+					if (tmp != 0 && (tmp & proc_enabled) == tmp) {
 						// source state is not a deadlock
 						outtrans_enabled = 1;
 						// start combining entries in the buffer to create target states
@@ -1197,7 +1190,7 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 						// Exchange the sync rules so every thread can update its cluster_trans
 						int sync_rule = __shfl(tmp, GTL((GROUP_ID + l) % d_nr_procs));
 						int proviso = __shfl(rule_proviso, GTL((GROUP_ID + l) % d_nr_procs));
-						if(GETBIT(GROUP_ID, sync_rule) && THREADGROUPCOUNTER == act) {
+						if(GETBIT(GROUP_ID, sync_rule) && sync_act == act) {
 							cluster_trans |= sync_rule;
 							proviso_satisfied |= proviso;
 						}
@@ -1205,32 +1198,9 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 				}
 
 				// only active threads should reset 'cont'
-				if (cont && THREADGROUPCOUNTER == act) {
+				if (cont && sync_act == act) {
 					cont = 0;
 				}
-				// finished an iteration of adding states.
-				// Is there still work? (is another iteration required?)
-				if (threadIdx.x == 0) {
-					if (CONTINUE != 2) {
-						CONTINUE = 0;
-					}
-				}
-				__syncthreads();
-				if (THREADINGROUP) {
-					if ((offset1 < offset2) || cont) {
-						if (CONTINUE != 2) {
-							CONTINUE = 1;
-						}
-					}
-				}
-				if (THREADINGROUP && GROUP_ID == 0) {
-					THREADGROUPCOUNTER = 1 << d_bits_act;
-				}
-				// FOR TEST PURPOSES!
-	//			if (threadIdx.x == 0) {
-	//				CONTINUE++;
-	//			}
-				__syncthreads();
 			} // END WHILE CONTINUE == 1
 
 			if(generate == 1 && THREADINGROUP) {
@@ -1274,10 +1244,6 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 				__syncthreads();
 			}
 			offset1 = orig_offset1;
-			if(THREADINGROUP) {
-				THREADGROUPCOUNTER = (1 << d_bits_act);
-			}
-			CONTINUE = 1;
 			if (d_apply_por) {
 				generate--;
 			} else {
