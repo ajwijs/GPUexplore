@@ -385,43 +385,6 @@ __device__ inttype LANE_POINTS_TO_EL(inttype i)	{
 #define STARTPOS_OF_EL_IN_BUCKET(i)			((i < (HALFWARPSIZE / d_sv_nints)) ? (i*d_sv_nints) : (HALFWARPSIZE + (i-(HALFWARPSIZE/d_sv_nints))*d_sv_nints))
 #define STARTPOS_OF_EL_IN_BUCKET_HOST(i)	((i < (HALFWARPSIZE / sv_nints)) ? (i*sv_nints) : (HALFWARPSIZE + (i-(HALFWARPSIZE/sv_nints))*sv_nints))
 
-// find or put element, single thread version.
-__device__ inttype FINDORPUT_SINGLE(inttype* t, inttype* d_q, volatile inttype* d_newstate_flags) {
-	inttype bi, bj, bk, bl;
-	indextype hashtmp;
-	for (bi = 0; bi < NR_HASH_FUNCTIONS; bi++) {
-		HASHFUNCTION(hashtmp, bi, t);
-		for (bj = 0; bj < NREL_IN_BUCKET; bj++) {
-			bl = d_q[hashtmp+STARTPOS_OF_EL_IN_BUCKET(bj)+(d_sv_nints-1)];
-			if (bl == EMPTYVECT32) {
-				bl = atomicCAS(&d_q[hashtmp+STARTPOS_OF_EL_IN_BUCKET(bj)+(d_sv_nints-1)], EMPTYVECT32, t[d_sv_nints-1]);
-				if (bl == EMPTYVECT32) {
-					// Write was successful
-					if (d_sv_nints > 1) {
-						for (bk = 0; bk < d_sv_nints-1; bk++) {
-							d_q[hashtmp+STARTPOS_OF_EL_IN_BUCKET(bj)+bk] = t[bk];
-						}
-					}
-					__threadfence();
-					// There is work available for some block
-					d_newstate_flags[(hashtmp / blockDim.x) % gridDim.x] = 1;
-				}
-			}
-			if (bl != EMPTYVECT32) {
-				COMPAREVECTORS(bk, &d_q[hashtmp+STARTPOS_OF_EL_IN_BUCKET(bj)], t);
-				if (bk == 1) {
-					// Found state in global memory
-					return 1;
-				}
-			}
-			else {
-				SETOLDSTATE(t);
-				return 1;
-			}
-		}
-	}
-	return 0;
-}
 
 // find or put element, warp version. t is element stored in block cache
 __device__ inttype FINDORPUT_WARP(inttype* t, inttype* d_q, volatile inttype* d_newstate_flags)	{
@@ -993,16 +956,12 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 									// if k == 8, cache is full, immediately store in global hash table
 									if(generate == 1) {
 										k = STOREINCACHE(tgt_state, d_q, &bi);
-										if (k == 8) {
-											// cache time-out; store directly in global hash table
-											if (FINDORPUT_SINGLE(tgt_state, d_q, d_newstate_flags) == 0) {
-												// ERROR! hash table too full. Set CONTINUE to 2
-												CONTINUE = 2;
+										if(d_apply_por) {
+											if(k >> 2) {
+												proviso_satisfied |= (k >> 1) & 1;
+											} else if (!d_check_cycle_proviso) {
+												SETPORSTATE(&shared[CACHEOFFSET + bi]);
 											}
-										} else if(k >> 2) {
-											proviso_satisfied |= (k >> 1) & 1;
-										} else if (!d_check_cycle_proviso) {
-											SETPORSTATE(&shared[CACHEOFFSET + bi]);
 										}
 									} else {
 										MARKINCACHE(tgt_state, d_q, (THREADGROUPPOR >> GROUP_ID) & 1);
@@ -1012,6 +971,16 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 								}
 							}
 							int c;
+							while(generate && (c = __ballot(i == 0 && k == 8))) {
+								int active_lane = __ffs(c) - 1;
+								bj = FINDORPUT_WARP((inttype*) &shared[TGTSTATEOFFSET + (threadIdx.x-LANE+active_lane)*d_sv_nints], d_q, d_newstate_flags);
+								if(LANE == active_lane) {
+									i = 1;
+									if(bj == 0) {
+										CONTINUE = 2;
+									}
+								}
+							}
 							while(generate && d_apply_por && d_check_cycle_proviso && (c = __ballot(i == 0 && (k >> 2 == 0)))) {
 								int active_lane = __ffs(c) - 1;
 								int cache_index = __shfl(bi, active_lane);
@@ -1132,16 +1101,12 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 							// if i == d_shared_q_size+1, cache is full, immediately store in global hash table
 							if(generate == 1) {
 								TMPVAR = STOREINCACHE(tgt_state, d_q, &bitmask);
-								if (TMPVAR == 8) {
-									// cache time-out; store directly in global hash table
-									if (FINDORPUT_SINGLE(tgt_state, d_q, d_newstate_flags) == 0) {
-										// ERROR! hash table too full. Set CONTINUE to 2
-										CONTINUE = 2;
+								if(d_apply_por) {
+									if(TMPVAR >> 2) {
+										rule_proviso |= (TMPVAR >> 1) & 1;
+									} else if (!d_check_cycle_proviso) {
+										SETPORSTATE(&shared[CACHEOFFSET + bitmask]);
 									}
-								} else if(TMPVAR >> 2) {
-									rule_proviso |= (TMPVAR >> 1) & 1;
-								} else if (!d_check_cycle_proviso) {
-									SETPORSTATE(&shared[CACHEOFFSET + bitmask]);
 								}
 							} else {
 								MARKINCACHE(tgt_state, d_q, (THREADGROUPPOR & tmp) == tmp);
@@ -1153,7 +1118,18 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 							}
 						}
 						int c;
-						while(generate && d_apply_por && d_check_cycle_proviso && (c = __ballot(l && TMPVAR >> 2 == 0))) {
+						while(generate && (c = __ballot(l && TMPVAR == 8))) {
+							int active_lane = __ffs(c) - 1;
+							bj = FINDORPUT_WARP((inttype*) &shared[TGTSTATEOFFSET + (threadIdx.x-LANE+active_lane)*d_sv_nints], d_q, d_newstate_flags);
+							if(LANE == active_lane) {
+								printf("Used findorput_warp because cache was full\n");
+								l = 0;
+								if(bj == 0) {
+									CONTINUE = 2;
+								}
+							}
+						}
+						while(generate && d_apply_por && d_check_cycle_proviso && (c = __ballot(l && (TMPVAR >> 2 == 0)))) {
 							int active_lane = __ffs(c) - 1;
 							int cache_index = __shfl(bitmask, active_lane);
 							bj = FIND_WARP((inttype*) &shared[CACHEOFFSET + cache_index], d_q);
