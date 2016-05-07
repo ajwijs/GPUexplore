@@ -771,17 +771,12 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 	for (i = threadIdx.x; i < LTSSTATESIZELEN; i += blockDim.x) {
 		shared[i+LTSSTATESIZEOFFSET] = d_bits_state[i];
 	}
-	// Reset the open queue tile
-	if (threadIdx.x < OPENTILELEN+LASTSEARCHLEN) {
-		shared[OPENTILEOFFSET+threadIdx.x] = EMPTYVECT32;
-	}
 	// Clean the cache
 	i = threadIdx.x;
 	while (i < (d_shared_q_size - CACHEOFFSET)) {
 		shared[CACHEOFFSET + i] = EMPTYVECT32;
 		i += blockDim.x;
 	}
-	__syncthreads();
 	if(scan) {
 		//Copy the work tile from global mem
 		if (threadIdx.x < OPENTILELEN + LASTSEARCHLEN) {
@@ -790,6 +785,8 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		if(threadIdx.x == 0) {
 			OPENTILECOUNT = d_worktiles[(OPENTILELEN+LASTSEARCHLEN+1) * blockIdx.x + OPENTILELEN + LASTSEARCHLEN];
 		}
+	} else if (threadIdx.x < OPENTILELEN) {
+		shared[OPENTILEOFFSET+threadIdx.x] = EMPTYVECT32;
 	}
 	__syncthreads();
 	inttype last_search_location = shared[LASTSEARCHOFFSET + WARP_ID];
