@@ -214,7 +214,7 @@ const size_t Mb = 1<<20;
 #define OTHERINT(t)								((t) & 0xBFFFFFFF)
 #define PORINT(t)								((t) | 0x40000000)
 
-#define STATE_FLAGS_MASK                        0x3FFFFFFF
+#define STATE_FLAGS_MASK                        (d_apply_por ? 0x3FFFFFFF : 0x7FFFFFFF)
 #define STRIPSTATE(t)							{(t)[(d_sv_nints-1)] = (t)[(d_sv_nints-1)] & STATE_FLAGS_MASK;}
 #define STRIPPEDSTATE(t, i)						((i == d_sv_nints-1) ? ((t)[i] & STATE_FLAGS_MASK) : (t)[i])
 #define STRIPPEDENTRY(t, i)						((i == d_sv_nints-1) ? ((t) & STATE_FLAGS_MASK) : (t))
@@ -754,7 +754,7 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 						inttype *d_firstbit_statevector, inttype *d_proc_offsets_start,
 						inttype *d_proc_offsets, inttype *d_proc_trans, inttype *d_syncbits_offsets,
 						inttype *d_syncbits, inttype *d_contBFS, inttype *d_property_violation,
-						volatile inttype *d_newstate_flags, inttype *d_worktiles, inttype scan) {
+						volatile inttype *d_newstate_flags, inttype *d_worktiles, inttype *d_counted_trans, inttype scan) {
 	//inttype global_id = (blockIdx.x * blockDim.x) + threadIdx.x;
 	//inttype group_nr = threadIdx.x / nr_procs;
 	inttype i, k, l, index, offset1, offset2, tmp, cont, act, sync_offset1, sync_offset2;
@@ -805,6 +805,482 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		shared[OPENTILEOFFSET+threadIdx.x] = EMPTYVECT32;
 	}
 	__syncthreads();
+	int num_trans = 0;
+	inttype last_search_location = shared[LASTSEARCHOFFSET + WARP_ID];
+	while (ITERATIONS < d_kernel_iters) {
+		if (threadIdx.x == 0 && OPENTILECOUNT < OPENTILELEN && d_newstate_flags[blockIdx.x]) {
+			// Indicate that we are scanning
+			d_newstate_flags[blockIdx.x] = 2;
+			SCAN = 1;
+		}
+		__syncthreads();
+		// Scan the open set for work; we use the OPENTILECOUNT flag at this stage to count retrieved elements
+		if (SCAN) {
+			// This block should be able to find a new state
+			int found_new_state = 0;
+			for (i = GLOBAL_WARP_ID; i < d_nrbuckets && OPENTILECOUNT < OPENTILELEN; i += NR_WARPS) {
+				int loc = i + last_search_location;
+				if(loc >= d_nrbuckets) {
+					last_search_location = -i + GLOBAL_WARP_ID;
+					loc = i + last_search_location;
+				}
+				tmp = d_q[loc*WARPSIZE+LANE];
+				l = EMPTYVECT32;
+				if (ENTRY_ID == (d_sv_nints-1)) {
+					if (ISNEWINT(tmp)) {
+						found_new_state = 1;
+						// try to increment the OPENTILECOUNT counter, if successful, store the state
+						l = atomicAdd((uint32_t *) &OPENTILECOUNT, d_sv_nints);
+						if (l < OPENTILELEN) {
+							d_q[loc*WARPSIZE+LANE] = OLDINT(tmp);
+						}
+					}
+				}
+				// all threads read the OPENTILECOUNT value of the 'tail' thread, and possibly store their part of the vector in the shared memory
+				if (LANEPOINTSTOVALIDBUCKETPOS) {
+					l = __shfl(l, LANE-ENTRY_ID+d_sv_nints-1);
+					if (l < OPENTILELEN) {
+						// write part of vector to shared memory
+						shared[OPENTILEOFFSET+l+ENTRY_ID] = tmp;
+					}
+				}
+			}
+			if(i < d_nrbuckets) {
+				last_search_location = i - GLOBAL_WARP_ID;
+			} else {
+				last_search_location = 0;
+			}
+			if(LANE == 0) {
+				shared[LASTSEARCHOFFSET + WARP_ID] = last_search_location;
+			}
+			if(found_new_state || i < d_nrbuckets) {
+				WORKSCANRESULT = 1;
+			}
+		}
+		__syncthreads();
+		// if work has been retrieved, indicate this
+		if (threadIdx.x == 0) {
+			if (OPENTILECOUNT > 0) {
+				(*d_contBFS) = 1;
+			}
+			if(SCAN && WORKSCANRESULT == 0 && d_newstate_flags[blockIdx.x] == 2) {
+				// Scanning has completed and no new states were found by this block,
+				// save this information to prevent unnecessary scanning later on
+				d_newstate_flags[blockIdx.x] = 0;
+			} else {
+				WORKSCANRESULT = 0;
+			}
+			scan = 0;
+		}
+		// is the thread part of an 'active' group?
+		offset1 = 0;
+		offset2 = 0;
+		if (THREADINGROUP) {
+			act = 1 << d_bits_act;
+			for (i = 0; i < d_max_buf_ints; i++) {
+				THREADBUFFERGROUPPOS(GROUP_ID, i) = 0;
+			}
+			// Is there work?
+			if (ISSTATE(src_state)) {
+				// Gather the required transition information for all states in the tile
+				i = tex1Dfetch(tex_proc_offsets_start, GROUP_ID);
+				// Determine process state
+				GETSTATEVECTORSTATE(cont, src_state, GROUP_ID);
+				// Offset position
+				index = cont/(INTSIZE/d_nbits_offset);
+				pos = cont - (index*(INTSIZE/d_nbits_offset));
+				tmp = tex1Dfetch(tex_proc_offsets, i+index);
+				GETTRANSOFFSET(offset1, tmp, pos);
+				if (pos == (INTSIZE/d_nbits_offset)-1) {
+					tmp = tex1Dfetch(tex_proc_offsets, i+index+1);
+					GETTRANSOFFSET(offset2, tmp, 0);
+				}
+				else {
+					GETTRANSOFFSET(offset2, tmp, pos+1);
+				}
+			}
+		}
+		// iterate over the outgoing transitions of state 'cont'
+		// variable cont is reused to indicate whether the buffer content of this thread still needs processing
+		cont = 0;
+		// while there is work to be done
+		outtrans_enabled = 0;
+		while (CONTINUE != 2 && __any(offset1 < offset2 || cont)) {
+			if (offset1 < offset2 && !cont) {
+				// reset act
+				act = (1 << (d_bits_act));
+				// reset buffer of this thread
+				for (l = 0; l < d_max_buf_ints; l++) {
+					THREADBUFFERGROUPPOS(GROUP_ID, l) = 0;
+				}
+			}
+			// if not sync, store in hash table
+			// loop over all transentries
+			while (1) {
+				i = 1;
+				if(offset1 < offset2  && !cont) {
+					tmp = tex1Dfetch(tex_proc_trans, offset1);
+					GETPROCTRANSSYNC(i, tmp);
+				}
+				if (__any(i == 0)) {
+					if(i == 0) {
+						// no deadlock
+						outtrans_enabled = 1;
+						// construct state
+						for (l = 0; l < d_sv_nints; l++) {
+							tgt_state[l] = src_state[l];
+						}
+						offset1++;
+					}
+					// loop over this transentry
+					for (l = 0; __any(i == 0 && l < NR_OF_STATES_IN_TRANSENTRY(GROUP_ID)); l++) {
+						if(i == 0) {
+							GETPROCTRANSSTATE(pos, tmp, l, GROUP_ID);
+							if (pos > 0) {
+								SETSTATEVECTORSTATE(tgt_state, GROUP_ID, pos-1);
+								// check for violation of safety property, if required
+								if (d_property == SAFETY) {
+									if (GROUP_ID == d_nr_procs-1) {
+										// pos contains state id + 1
+										// error state is state 1
+										if (pos == 2) {
+											// error state found
+											(*d_property_violation) = 1;
+										}
+									}
+								}
+								num_trans++;
+								// store tgt_state in cache
+								// if k == 8, cache is full, immediately store in global hash table
+								k = STOREINCACHE(tgt_state, d_q, &bi);
+							} else {
+								i = 1;
+							}
+						}
+						int c;
+						while((c = __ballot(i == 0 && k == 8))) {
+							int active_lane = __ffs(c) - 1;
+							bj = FINDORPUT_WARP((inttype*) &shared[TGTSTATEOFFSET + (threadIdx.x-LANE+active_lane)*d_sv_nints], d_q, d_newstate_flags);
+							if(LANE == active_lane) {
+								i = 1;
+								if(bj == 0) {
+									CONTINUE = 2;
+								}
+							}
+						}
+					}
+				} else {
+					break;
+				}
+			}
+
+			// i is the current relative position in the buffer for this thread
+			i = 0;
+			if (offset1 < offset2 && !cont) {
+				GETPROCTRANSACT(act, tmp);
+				// store transition entry
+				THREADBUFFERGROUPPOS(GROUP_ID,i) = tmp;
+				cont = 1;
+				i++;
+				offset1++;
+				while (offset1 < offset2) {
+					tmp = tex1Dfetch(tex_proc_trans, offset1);
+					GETPROCTRANSACT(bitmask, tmp);
+					if (act == bitmask) {
+						THREADBUFFERGROUPPOS(GROUP_ID,i) = tmp;
+						i++;
+						offset1++;
+					}
+					else {
+						break;
+					}
+				}
+			}
+			int sync_act = cont ? act : (1 << d_bits_act);
+			for(i = 1; i < d_nr_procs; i<<=1) {
+				sync_act = min(__shfl(sync_act, GTL((GROUP_ID + i) % d_nr_procs)), sync_act);
+			}
+			// Now, we have obtained the info needed to combine process transitions
+			sync_offset1 = sync_offset2 = 0;
+			int proc_enabled = (__ballot(act == sync_act) >> (LANE - GROUP_ID)) & ((1 << d_nr_procs) - 1);
+			//&& (__popc(proc_enabled) >= 2)
+			if(THREADINGROUP && sync_act < (1 << d_bits_act) && (__popc(proc_enabled) >= 2)) {
+				// syncbits Offset position
+				i = sync_act/(INTSIZE/d_nbits_syncbits_offset);
+				pos = sync_act - (i*(INTSIZE/d_nbits_syncbits_offset));
+				l = tex1Dfetch(tex_syncbits_offsets, i);
+				GETSYNCOFFSET(sync_offset1, l, pos);
+				if (pos == (INTSIZE/d_nbits_syncbits_offset)-1) {
+					l = tex1Dfetch(tex_syncbits_offsets, i+1);
+					GETSYNCOFFSET(sync_offset2, l, 0);
+				}
+				else {
+					GETSYNCOFFSET(sync_offset2, l, pos+1);
+				}
+			}
+			// iterate through the relevant syncbit filters
+			tmp = 1;
+			for (int j = GROUP_ID;__any(sync_offset1 + j / (INTSIZE/d_nr_procs) < sync_offset2 && tmp); j+=d_nr_procs) {
+				index = 0;
+				if(THREADINGROUP && sync_act < (1 << d_bits_act) && sync_offset1 + j / (INTSIZE/d_nr_procs) < sync_offset2 && tmp) {
+					index = tex1Dfetch(tex_syncbits, sync_offset1 + j / (INTSIZE/d_nr_procs));
+				}
+				SETOLDSTATE(tgt_state);
+				int has_second_succ = 0;
+				GETSYNCRULE(tmp, index, j % (INTSIZE/d_nr_procs));
+				if (tmp != 0 && (tmp & proc_enabled) == tmp) {
+					// source state is not a deadlock
+					outtrans_enabled = 1;
+					// start combining entries in the buffer to create target states
+					// if sync rule applicable, construct the first successor
+					// copy src_state into tgt_state
+					for (pos = 0; pos < d_sv_nints; pos++) {
+						tgt_state[pos] = src_state[pos];
+					}
+					// construct first successor
+					for (int rule = tmp; rule;) {
+						pos = __ffs(rule) - 1;
+						// get first state
+						GETPROCTRANSSTATE(k, THREADBUFFERGROUPPOS(pos,0), 0, pos);
+						SETSTATEVECTORSTATE(tgt_state, pos, k-1);
+						GETPROCTRANSSTATE(k, THREADBUFFERGROUPPOS(pos,0), 1, pos);
+						has_second_succ |= k;
+						if(d_max_buf_ints > 1 && !k) {
+							GETPROCTRANSSTATE(k, THREADBUFFERGROUPPOS(pos,1), 0, pos);
+							has_second_succ |= k;
+						}
+						rule &= ~(1 << pos);
+					}
+					SETNEWSTATE(tgt_state);
+				}
+				// while we keep getting new states, store them
+				while (__any(ISNEWSTATE(tgt_state))) {
+					l = k = TMPVAR = bitmask = 0;
+					if(ISNEWSTATE(tgt_state)) {
+						// check for violation of safety property, if required
+						if (d_property == SAFETY) {
+							GETSTATEVECTORSTATE(pos, tgt_state, d_nr_procs-1);
+							if (pos == 1) {
+								// error state found
+								(*d_property_violation) = 1;
+							}
+						}
+
+						num_trans++;
+						// store tgt_state in cache; if i == d_shared_q_size, state was found, duplicate detected
+						// if i == d_shared_q_size+1, cache is full, immediately store in global hash table
+						TMPVAR = STOREINCACHE(tgt_state, d_q, &bitmask);
+						l = 1;
+						k = has_second_succ;
+						if(!has_second_succ) {
+							SETOLDSTATE(tgt_state);
+						}
+					}
+					int c;
+					while((c = __ballot(l && TMPVAR == 8))) {
+						int active_lane = __ffs(c) - 1;
+						bj = FINDORPUT_WARP((inttype*) &shared[TGTSTATEOFFSET + (threadIdx.x-LANE+active_lane)*d_sv_nints], d_q, d_newstate_flags);
+						if(LANE == active_lane) {
+							printf("Used findorput_warp because cache was full\n");
+							l = 0;
+							if(bj == 0) {
+								CONTINUE = 2;
+							}
+						}
+					}
+					if(k) {
+						// get next successor
+						int rule;
+						for (rule = tmp; rule;) {
+							pos = __ffs(rule) - 1;
+							int curr_st;
+							GETSTATEVECTORSTATE(curr_st, tgt_state, pos);
+							int st = 0;
+							for (k = 0; k < d_max_buf_ints; k++) {
+								for (l = 0; l < NR_OF_STATES_IN_TRANSENTRY(pos); l++) {
+									GETPROCTRANSSTATE(st, THREADBUFFERGROUPPOS(pos,k), l, pos);
+									if (curr_st == (st-1)) {
+										break;
+									}
+								}
+								if (curr_st == (st-1)) {
+									break;
+								}
+							}
+							// Assumption: element has been found (otherwise, 'last' was not a valid successor)
+							// Try to get the next element
+							if (l == NR_OF_STATES_IN_TRANSENTRY(pos) - 1) {
+								if (k >= d_max_buf_ints-1) {
+									st = 0;
+								}
+								else {
+									k++;
+									l = 0;
+								}
+							}
+							else {
+								l++;
+							}
+							// Retrieve next element, insert it in 'tgt_state' if it is not 0, and return result, otherwise continue
+							if (st != 0) {
+								GETPROCTRANSSTATE(st, THREADBUFFERGROUPPOS(pos,k), l, pos);
+								if (st > 0) {
+									SETSTATEVECTORSTATE(tgt_state, pos, st-1);
+									SETNEWSTATE(tgt_state);
+									break;
+								}
+							}
+							// else, set this process state to first one, and continue to next process
+							GETPROCTRANSSTATE(st, THREADBUFFERGROUPPOS(pos,0), 0, pos);
+							SETSTATEVECTORSTATE(tgt_state, pos, st-1);
+							rule &= ~(1 << pos);
+						}
+						// did we find a successor? if not, set tgt_state to old
+						if (rule == 0) {
+							SETOLDSTATE(tgt_state);
+						}
+					}
+				}
+			}
+
+			// only active threads should reset 'cont'
+			if (cont && sync_act == act) {
+				cont = 0;
+			}
+		}
+
+		// have we encountered a deadlock state?
+		// we use the shared memory to communicate this to the group leaders
+		if (d_property == DEADLOCK) {
+			if (THREADINGROUP) {
+				if (ISSTATE(src_state)) {
+					THREADBUFFERGROUPPOS(GROUP_ID, 0) = outtrans_enabled;
+					// group leader collects results
+					l = 0;
+					if (GROUP_ID == 0) {
+						for (i = 0; i < d_nr_procs; i++) {
+							l += THREADBUFFERGROUPPOS(i, 0);
+						}
+						if (l == 0) {
+							// deadlock state found
+							(*d_property_violation) = 1;
+						}
+					}
+				}
+			}
+		}
+		int performed_work = OPENTILECOUNT != 0;
+		__syncthreads();
+		// Reset the open queue tile
+		if (threadIdx.x < OPENTILELEN) {
+			shared[OPENTILEOFFSET+threadIdx.x] = EMPTYVECT32;
+		}
+		if (threadIdx.x == 0) {
+			OPENTILECOUNT = 0;
+		}
+		__syncthreads();
+		// start scanning the local cache and write results to the global hash table
+		k = (d_shared_q_size-CACHEOFFSET)/d_sv_nints;
+		int c;
+		for (i = WARP_ID; performed_work && i * WARPSIZE < k; i += (blockDim.x / WARPSIZE)) {
+			int have_new_state = i * WARPSIZE + LANE < k && ISNEWSTATE(&shared[CACHEOFFSET+(i*WARPSIZE+LANE)*d_sv_nints]);
+			while (c = __ballot(have_new_state)) {
+				int active_lane = __ffs(c) - 1;
+				if(FINDORPUT_WARP((inttype*) &shared[CACHEOFFSET + (i*WARPSIZE+active_lane)*d_sv_nints], d_q, d_newstate_flags) == 0) {
+					CONTINUE = 2;
+				}
+				if (LANE == active_lane) {
+					have_new_state = 0;
+				}
+			}
+		}
+		__syncthreads();
+		// Ready to start next iteration, if error has not occurred
+		if (threadIdx.x == 0) {
+			if (CONTINUE == 2) {
+				(*d_contBFS) = 2;
+				ITERATIONS = d_kernel_iters;
+			}
+			else {
+				ITERATIONS++;
+			}
+			CONTINUE = 0;
+		}
+		__syncthreads();
+	}
+	atomicAdd((inttype*)&CONTINUE, num_trans);
+	__syncthreads();
+	if(threadIdx.x == 0) {
+		atomicAdd(d_counted_trans, CONTINUE);
+	}
+
+	//Copy the work tile to global mem
+	if (threadIdx.x < OPENTILELEN+LASTSEARCHLEN) {
+		d_worktiles[(OPENTILELEN+LASTSEARCHLEN+1) * blockIdx.x + threadIdx.x] = shared[OPENTILEOFFSET+threadIdx.x];
+	}
+	if(threadIdx.x == 0) {
+		d_worktiles[(OPENTILELEN+LASTSEARCHLEN+1) * blockIdx.x + OPENTILELEN+LASTSEARCHLEN] = OPENTILECOUNT;
+	}
+}
+
+__global__ void
+__launch_bounds__(512, 2)
+gather_por(inttype *d_q, inttype *d_h, inttype *d_bits_state,
+						inttype *d_firstbit_statevector, inttype *d_proc_offsets_start,
+						inttype *d_proc_offsets, inttype *d_proc_trans, inttype *d_syncbits_offsets,
+						inttype *d_syncbits, inttype *d_contBFS, inttype *d_property_violation,
+						volatile inttype *d_newstate_flags, inttype *d_worktiles, inttype *d_counted_trans, inttype scan) {
+	//inttype global_id = (blockIdx.x * blockDim.x) + threadIdx.x;
+	//inttype group_nr = threadIdx.x / nr_procs;
+	inttype i, k, l, index, offset1, offset2, tmp, cont, act, sync_offset1, sync_offset2;
+	volatile inttype* src_state = &shared[OPENTILEOFFSET+d_sv_nints*GROUP_GID];
+	volatile inttype* tgt_state = &shared[TGTSTATEOFFSET+threadIdx.x*d_sv_nints];
+	inttype bitmask, bi, bj;
+	int pos;
+	// TODO: remove this
+	inttype TMPVAR;
+	// is at least one outgoing transition enabled for a given state (needed to detect deadlocks)
+	inttype outtrans_enabled;
+
+	for (i = threadIdx.x; i < d_shared_q_size; i += blockDim.x) {
+		shared[i] = 0;
+	}
+	// Locally store the state sizes and syncbits
+	i = threadIdx.x;
+	if (i == 0) {
+		ITERATIONS = 0;
+		OPENTILECOUNT = 0;
+		WORKSCANRESULT = 0;
+		SCAN = 0;
+	}
+	for (i = threadIdx.x; i < HASHCONSTANTSLEN; i += blockDim.x) {
+		shared[i+HASHCONSTANTSOFFSET] = d_h[i];
+	}
+	for (i = threadIdx.x; i < VECTORPOSLEN; i += blockDim.x) {
+		shared[i+VECTORPOSOFFSET] = d_firstbit_statevector[i];
+	}
+	for (i = threadIdx.x; i < LTSSTATESIZELEN; i += blockDim.x) {
+		shared[i+LTSSTATESIZEOFFSET] = d_bits_state[i];
+	}
+	// Clean the cache
+	i = threadIdx.x;
+	while (i < (d_shared_q_size - CACHEOFFSET)) {
+		shared[CACHEOFFSET + i] = EMPTYVECT32;
+		i += blockDim.x;
+	}
+	if(scan) {
+		//Copy the work tile from global mem
+		if (threadIdx.x < OPENTILELEN + LASTSEARCHLEN) {
+			shared[OPENTILEOFFSET+threadIdx.x] = d_worktiles[(OPENTILELEN+LASTSEARCHLEN+1) * blockIdx.x + threadIdx.x];
+		}
+		if(threadIdx.x == 0) {
+			OPENTILECOUNT = d_worktiles[(OPENTILELEN+LASTSEARCHLEN+1) * blockIdx.x + OPENTILELEN + LASTSEARCHLEN];
+		}
+	} else if (threadIdx.x < OPENTILELEN) {
+		shared[OPENTILEOFFSET+threadIdx.x] = EMPTYVECT32;
+	}
+	__syncthreads();
+	int num_trans = 0;
 	inttype last_search_location = shared[LASTSEARCHOFFSET + WARP_ID];
 	while (ITERATIONS < d_kernel_iters) {
 		if (threadIdx.x == 0 && OPENTILECOUNT < OPENTILELEN && d_newstate_flags[blockIdx.x]) {
@@ -961,16 +1437,15 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 										// Set proviso to 1 to indicate at least one state has been found
 										proviso_satisfied = 1;
 									}
+									num_trans++;
 									// store tgt_state in cache
 									// if k == 8, cache is full, immediately store in global hash table
 									if(generate == 1) {
 										k = STOREINCACHE(tgt_state, d_q, &bi);
-										if(d_apply_por) {
-											if(k >> 2) {
-												proviso_satisfied |= (k >> 1) & 1;
-											} else if (!d_check_cycle_proviso) {
-												SETPORSTATE(&shared[CACHEOFFSET + bi]);
-											}
+										if(k >> 2) {
+											proviso_satisfied |= (k >> 1) & 1;
+										} else if (!d_check_cycle_proviso) {
+											SETPORSTATE(&shared[CACHEOFFSET + bi]);
 										}
 									} else {
 										MARKINCACHE(tgt_state, d_q, (THREADGROUPPOR >> GROUP_ID) & 1);
@@ -990,7 +1465,7 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 									}
 								}
 							}
-							while(generate && d_apply_por && d_check_cycle_proviso && (c = __ballot(i == 0 && (k >> 2 == 0)))) {
+							while(generate && d_check_cycle_proviso && (c = __ballot(i == 0 && (k >> 2 == 0)))) {
 								int active_lane = __ffs(c) - 1;
 								int cache_index = __shfl(bi, active_lane);
 								bj = FIND_WARP((inttype*) &shared[CACHEOFFSET + cache_index], d_q);
@@ -1036,7 +1511,8 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 				// Now, we have obtained the info needed to combine process transitions
 				sync_offset1 = sync_offset2 = 0;
 				int proc_enabled = (__ballot(act == sync_act) >> (LANE - GROUP_ID)) & ((1 << d_nr_procs) - 1);
-				if(THREADINGROUP && sync_act < (1 << d_bits_act) && (generate == 1 || __popc(proc_enabled) >= 2)) {
+				//&& (__popc(proc_enabled) >= 2)
+				if(THREADINGROUP && sync_act < (1 << d_bits_act)) {
 					// syncbits Offset position
 					i = sync_act/(INTSIZE/d_nbits_syncbits_offset);
 					pos = sync_act - (i*(INTSIZE/d_nbits_syncbits_offset));
@@ -1103,16 +1579,15 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 								// Set rule_proviso to 1 to indicate at least one state has been found
 								rule_proviso = 1;
 							}
+							num_trans++;
 							// store tgt_state in cache; if i == d_shared_q_size, state was found, duplicate detected
 							// if i == d_shared_q_size+1, cache is full, immediately store in global hash table
 							if(generate == 1) {
 								TMPVAR = STOREINCACHE(tgt_state, d_q, &bitmask);
-								if(d_apply_por) {
-									if(TMPVAR >> 2) {
-										rule_proviso |= (TMPVAR >> 1) & 1;
-									} else if (!d_check_cycle_proviso) {
-										SETPORSTATE(&shared[CACHEOFFSET + bitmask]);
-									}
+								if(TMPVAR >> 2) {
+									rule_proviso |= (TMPVAR >> 1) & 1;
+								} else if (!d_check_cycle_proviso) {
+									SETPORSTATE(&shared[CACHEOFFSET + bitmask]);
 								}
 							} else {
 								MARKINCACHE(tgt_state, d_q, (THREADGROUPPOR & tmp) == tmp);
@@ -1135,7 +1610,7 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 								}
 							}
 						}
-						while(generate && d_apply_por && d_check_cycle_proviso && (c = __ballot(l && (TMPVAR >> 2 == 0)))) {
+						while(generate && d_check_cycle_proviso && (c = __ballot(l && (TMPVAR >> 2 == 0)))) {
 							int active_lane = __ffs(c) - 1;
 							int cache_index = __shfl(bitmask, active_lane);
 							bj = FIND_WARP((inttype*) &shared[CACHEOFFSET + cache_index], d_q);
@@ -1257,11 +1732,7 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 				__syncthreads();
 			}
 			offset1 = orig_offset1;
-			if (d_apply_por) {
-				generate--;
-			} else {
-				generate = -1;
-			}
+			generate--;
 		} // END while(generate > -1)
 
 		// have we encountered a deadlock state?
@@ -1322,6 +1793,11 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 			CONTINUE = 0;
 		}
 		__syncthreads();
+	}
+	atomicAdd((inttype*)&CONTINUE, num_trans);
+	__syncthreads();
+	if(threadIdx.x == 0) {
+		atomicAdd(d_counted_trans, CONTINUE);
 	}
 
 	//Copy the work tile to global mem
@@ -1472,7 +1948,7 @@ int main(int argc, char** argv) {
 		proc_nrstates = atoi(stmp);
 		fprintf(stdout, "min. nr. of proc. states that fit in 32-bit integer: %d\n", proc_nrstates);
 		fgets(stmp, BUFFERSIZE, fp);
-		bits_statevector = atoi(stmp) + 1;
+		bits_statevector = atoi(stmp) + apply_por;
 		fprintf(stdout, "number of bits needed for a state vector: %d\n", bits_statevector);
 		firstbit_statevector = (inttype*) malloc(sizeof(inttype)*(nr_procs+1));
 		for (int i = 0; i <= nr_procs; i++) {
@@ -1608,6 +2084,7 @@ int main(int argc, char** argv) {
 	CUDA_CHECK_RETURN(cudaMemcpy(d_syncbits, syncbits, nr_syncbits*sizeof(inttype), cudaMemcpyHostToDevice))
 	CUDA_CHECK_RETURN(cudaMemset(d_newstate_flags, 0, nblocks*sizeof(inttype)));
 	CUDA_CHECK_RETURN(cudaMemset(d_worktiles, 0, nblocks * (sv_nints*(nthreadsperblock/nr_procs)+nthreadsperblock/WARPSIZE+1)*sizeof(inttype)));
+	CUDA_CHECK_RETURN(cudaMemset(d_counted_states, 0, sizeof(inttype)));
 
 	// Bind data to textures
 	cudaBindTexture(NULL, tex_proc_offsets_start, d_proc_offsets_start, (nr_procs+1)*sizeof(inttype));
@@ -1671,8 +2148,13 @@ int main(int argc, char** argv) {
 	inttype property_violation = 0;
 	while (contBFS == 1) {
 		CUDA_CHECK_RETURN(cudaMemcpy(d_contBFS, &zero, sizeof(inttype), cudaMemcpyHostToDevice))
-		gather<<<nblocks, nthreadsperblock, shared_q_size*sizeof(inttype)>>>(d_q, d_h, d_bits_state, d_firstbit_statevector, d_proc_offsets_start,
-																		d_proc_offsets, d_proc_trans, d_syncbits_offsets, d_syncbits, d_contBFS, d_property_violation, d_newstate_flags, d_worktiles, scan);
+		if(apply_por) {
+			gather_por<<<nblocks, nthreadsperblock, shared_q_size*sizeof(inttype)>>>(d_q, d_h, d_bits_state, d_firstbit_statevector, d_proc_offsets_start,
+																		d_proc_offsets, d_proc_trans, d_syncbits_offsets, d_syncbits, d_contBFS, d_property_violation, d_newstate_flags, d_worktiles, d_counted_states, scan);
+		} else {
+			gather<<<nblocks, nthreadsperblock, shared_q_size*sizeof(inttype)>>>(d_q, d_h, d_bits_state, d_firstbit_statevector, d_proc_offsets_start,
+																		d_proc_offsets, d_proc_trans, d_syncbits_offsets, d_syncbits, d_contBFS, d_property_violation, d_newstate_flags, d_worktiles, d_counted_states, scan);
+		}
 		// copy progress result
 		//CUDA_CHECK_RETURN(cudaGetLastError());
 		CUDA_CHECK_RETURN(cudaDeviceSynchronize());
@@ -1721,6 +2203,8 @@ int main(int argc, char** argv) {
 		fprintf (stderr, "ERROR: problem with hash table\n");
 	}
 
+	CUDA_CHECK_RETURN(cudaMemcpy(&counted_states, d_counted_states, sizeof(inttype), cudaMemcpyDeviceToHost));
+	fprintf (stdout, "nr. of trans: %d\n", counted_states);
 	CUDA_CHECK_RETURN(cudaMemset(d_counted_states, 0, sizeof(inttype)));
 	count_states<<<((int) prop.multiProcessorCount)*4, 512, 1>>>(d_q, d_counted_states);
 	CUDA_CHECK_RETURN(cudaDeviceSynchronize());
