@@ -387,7 +387,7 @@ __device__ inttype LANE_POINTS_TO_EL(inttype i)	{
 
 
 // find or put element, warp version. t is element stored in block cache
-__device__ inttype FINDORPUT_WARP(inttype* t, inttype* d_q, volatile inttype* d_newstate_flags)	{
+__device__ inttype FINDORPUT_WARP(inttype* t, inttype* d_q, volatile inttype* d_newstate_flags, inttype claim_work)	{
 	inttype bi, bj, bk, bl, bitmask;
 	indextype hashtmp;
 	BucketEntryStatus threadstatus;
@@ -432,8 +432,7 @@ __device__ inttype FINDORPUT_WARP(inttype* t, inttype* d_q, volatile inttype* d_
 					bl = OPENTILELEN;
 					if (ENTRY_ID == d_sv_nints-1) {
 						// try to increment the OPENTILECOUNT counter
-						bl = atomicAdd((inttype *) &OPENTILECOUNT, d_sv_nints);
-						if (bl < OPENTILELEN) {
+						if (claim_work && (bl = atomicAdd((inttype *) &OPENTILECOUNT, d_sv_nints)) < OPENTILELEN) {
 							d_q[hashtmp+LANE] = t[d_sv_nints-1];
 						} else {
 							// There is work available for some block
@@ -441,7 +440,7 @@ __device__ inttype FINDORPUT_WARP(inttype* t, inttype* d_q, volatile inttype* d_
 							d_newstate_flags[(hashtmp / blockDim.x) % gridDim.x] = 1;
 						}
 					}
-					// all active threads read the OPENTILECOUNT value of the first thread, and possibly store their part of the vector in the shared memory
+					// all active threads read the OPENTILECOUNT value of the last thread, and possibly store their part of the vector in the shared memory
 					bl = __shfl(bl, LANE-ENTRY_ID+d_sv_nints-1);
 					if (bl < OPENTILELEN) {
 						// write part of vector to shared memory
@@ -729,6 +728,35 @@ __global__ void count_states(inttype *d_q, inttype *result) {
 	}
 }
 
+__device__ void store_cache_overflow_warp(inttype *d_q, volatile inttype *d_newstate_flags, int has_overflow) {
+	while(int c = __ballot(has_overflow)) {
+		int active_lane = __ffs(c) - 1;
+		int bj = FINDORPUT_WARP((inttype*) &shared[TGTSTATEOFFSET + (threadIdx.x-LANE+active_lane)*d_sv_nints], d_q, d_newstate_flags, 0);
+		if(LANE == active_lane) {
+			has_overflow = 0;
+			if(bj == 0) {
+				CONTINUE = 2;
+			}
+		}
+	}
+}
+
+__device__ void copy_cache_to_global(inttype *d_q, volatile inttype *d_newstate_flags) {
+	int k = (d_shared_q_size-CACHEOFFSET)/d_sv_nints;
+	for (int i = WARP_ID; i * WARPSIZE < k; i += (blockDim.x / WARPSIZE)) {
+		int have_new_state = i * WARPSIZE + LANE < k && ISNEWSTATE(&shared[CACHEOFFSET+(i*WARPSIZE+LANE)*d_sv_nints]);
+		while (int c = __ballot(have_new_state)) {
+			int active_lane = __ffs(c) - 1;
+			if(FINDORPUT_WARP((inttype*) &shared[CACHEOFFSET + (i*WARPSIZE+active_lane)*d_sv_nints], d_q, d_newstate_flags, 1) == 0) {
+				CONTINUE = 2;
+			}
+			if (LANE == active_lane) {
+				have_new_state = 0;
+			}
+		}
+	}
+}
+
 /**
  * CUDA kernel function for BFS iteration state gathering
  * Order of data in the shared queue:
@@ -957,17 +985,7 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 								i = 1;
 							}
 						}
-						int c;
-						while((c = __ballot(i == 0 && k == 8))) {
-							int active_lane = __ffs(c) - 1;
-							bj = FINDORPUT_WARP((inttype*) &shared[TGTSTATEOFFSET + (threadIdx.x-LANE+active_lane)*d_sv_nints], d_q, d_newstate_flags);
-							if(LANE == active_lane) {
-								i = 1;
-								if(bj == 0) {
-									CONTINUE = 2;
-								}
-							}
-						}
+						store_cache_overflow_warp(d_q, d_newstate_flags, i == 0 && k == 8);
 					}
 				} else {
 					break;
@@ -1076,18 +1094,7 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 							SETOLDSTATE(tgt_state);
 						}
 					}
-					int c;
-					while((c = __ballot(l && TMPVAR == 8))) {
-						int active_lane = __ffs(c) - 1;
-						bj = FINDORPUT_WARP((inttype*) &shared[TGTSTATEOFFSET + (threadIdx.x-LANE+active_lane)*d_sv_nints], d_q, d_newstate_flags);
-						if(LANE == active_lane) {
-							printf("Used findorput_warp because cache was full\n");
-							l = 0;
-							if(bj == 0) {
-								CONTINUE = 2;
-							}
-						}
-					}
+					store_cache_overflow_warp(d_q, d_newstate_flags, l && TMPVAR == 8);
 					if(k) {
 						// get next successor
 						int rule;
@@ -1180,19 +1187,8 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		}
 		__syncthreads();
 		// start scanning the local cache and write results to the global hash table
-		k = (d_shared_q_size-CACHEOFFSET)/d_sv_nints;
-		int c;
-		for (i = WARP_ID; performed_work && i * WARPSIZE < k; i += (blockDim.x / WARPSIZE)) {
-			int have_new_state = i * WARPSIZE + LANE < k && ISNEWSTATE(&shared[CACHEOFFSET+(i*WARPSIZE+LANE)*d_sv_nints]);
-			while (c = __ballot(have_new_state)) {
-				int active_lane = __ffs(c) - 1;
-				if(FINDORPUT_WARP((inttype*) &shared[CACHEOFFSET + (i*WARPSIZE+active_lane)*d_sv_nints], d_q, d_newstate_flags) == 0) {
-					CONTINUE = 2;
-				}
-				if (LANE == active_lane) {
-					have_new_state = 0;
-				}
-			}
+		if(performed_work) {
+			copy_cache_to_global(d_q, d_newstate_flags);
 		}
 		__syncthreads();
 		// Ready to start next iteration, if error has not occurred
@@ -1454,17 +1450,8 @@ gather_por(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 									i = 1;
 								}
 							}
+							store_cache_overflow_warp(d_q, d_newstate_flags, i == 0 && k == 8);
 							int c;
-							while(generate && (c = __ballot(i == 0 && k == 8))) {
-								int active_lane = __ffs(c) - 1;
-								bj = FINDORPUT_WARP((inttype*) &shared[TGTSTATEOFFSET + (threadIdx.x-LANE+active_lane)*d_sv_nints], d_q, d_newstate_flags);
-								if(LANE == active_lane) {
-									i = 1;
-									if(bj == 0) {
-										CONTINUE = 2;
-									}
-								}
-							}
 							while(generate && d_check_cycle_proviso && (c = __ballot(i == 0 && (k >> 2 == 0)))) {
 								int active_lane = __ffs(c) - 1;
 								int cache_index = __shfl(bi, active_lane);
@@ -1598,18 +1585,8 @@ gather_por(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 								SETOLDSTATE(tgt_state);
 							}
 						}
+						store_cache_overflow_warp(d_q, d_newstate_flags, l && TMPVAR == 8);
 						int c;
-						while(generate && (c = __ballot(l && TMPVAR == 8))) {
-							int active_lane = __ffs(c) - 1;
-							bj = FINDORPUT_WARP((inttype*) &shared[TGTSTATEOFFSET + (threadIdx.x-LANE+active_lane)*d_sv_nints], d_q, d_newstate_flags);
-							if(LANE == active_lane) {
-								printf("Used findorput_warp because cache was full\n");
-								l = 0;
-								if(bj == 0) {
-									CONTINUE = 2;
-								}
-							}
-						}
 						while(generate && d_check_cycle_proviso && (c = __ballot(l && (TMPVAR >> 2 == 0)))) {
 							int active_lane = __ffs(c) - 1;
 							int cache_index = __shfl(bitmask, active_lane);
@@ -1766,19 +1743,8 @@ gather_por(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		}
 		__syncthreads();
 		// start scanning the local cache and write results to the global hash table
-		k = (d_shared_q_size-CACHEOFFSET)/d_sv_nints;
-		int c;
-		for (i = WARP_ID; performed_work && i * WARPSIZE < k; i += (blockDim.x / WARPSIZE)) {
-			int have_new_state = i * WARPSIZE + LANE < k && ISNEWSTATE(&shared[CACHEOFFSET+(i*WARPSIZE+LANE)*d_sv_nints]);
-			while (c = __ballot(have_new_state)) {
-				int active_lane = __ffs(c) - 1;
-				if(FINDORPUT_WARP((inttype*) &shared[CACHEOFFSET + (i*WARPSIZE+active_lane)*d_sv_nints], d_q, d_newstate_flags) == 0) {
-					CONTINUE = 2;
-				}
-				if (LANE == active_lane) {
-					have_new_state = 0;
-				}
-			}
+		if(performed_work) {
+			copy_cache_to_global(d_q, d_newstate_flags);
 		}
 		__syncthreads();
 		// Ready to start next iteration, if error has not occurred
