@@ -132,9 +132,9 @@ const size_t Mb = 1<<20;
 // parameter is thread id
 #define THREADBUFFERGROUPSTART(i)		(THREADBUFFEROFFSET+ (((i) / WARPSIZE)*GROUPS_PER_WARP+(((i) % WARPSIZE) / d_nr_procs)) * (THREADBUFFERSHARED+(d_nr_procs*d_max_buf_ints)))
 // parameter is group id
-#define THREADBUFFERGROUPPOS(i, j)		shared[THREADBUFFERGROUPSTART(threadIdx.x)+THREADBUFFERSHARED+((i)*d_max_buf_ints)+(j)]
-#define THREADGROUPCOUNTER				shared[(THREADBUFFERGROUPSTART(threadIdx.x))]
-#define THREADGROUPPOR					shared[(THREADBUFFERGROUPSTART(threadIdx.x)) + 1]
+#define THREADBUFFERGROUPPOS(i, j)		shared[tbgs+THREADBUFFERSHARED+((i)*d_max_buf_ints)+(j)]
+#define THREADGROUPCOUNTER				shared[tbgs]
+#define THREADGROUPPOR					shared[tbgs + 1]
 #define OPENTILESTATEPART(i)			shared[OPENTILEOFFSET+(d_sv_nints*((WARP_ID*GROUPS_PER_WARP+(LANE / d_nr_procs))))+(i)]
 
 #define THREADINGROUP					(LANE < (GROUPS_PER_WARP)*d_nr_procs)
@@ -237,7 +237,7 @@ const size_t Mb = 1<<20;
 // HASH TABLE MACROS
 
 // Return 0 if not found, bit 2 is flag for new state, bit 3 is a flag for POR state, 8 if cache is full
-__device__ inttype STOREINCACHE(volatile inttype* t, inttype* d_q, inttype* address) {
+__device__ inttype STOREINCACHE(volatile inttype* t, inttype* cache, inttype* address) {
 	inttype bi, bj, bk, bl, bitmask;
 	indextype hashtmp;
 	STRIPSTATE(t);
@@ -250,10 +250,10 @@ __device__ inttype STOREINCACHE(volatile inttype* t, inttype* d_q, inttype* addr
 	SETNEWSTATE(t);
 	bl = 0;
 	while (bl < CACHERETRYFREQ) {
-		bi = atomicCAS((inttype *) &shared[CACHEOFFSET+bitmask+(d_sv_nints-1)], EMPTYVECT32, t[d_sv_nints-1]);
+		bi = atomicCAS((inttype *) &cache[bitmask+(d_sv_nints-1)], EMPTYVECT32, t[d_sv_nints-1]);
 		if (bi == EMPTYVECT32) {
 			for (bj = 0; bj < d_sv_nints-1; bj++) {
-				shared[CACHEOFFSET+bitmask+bj] = t[bj];
+				cache[bitmask+bj] = t[bj];
 			}
 			*address = bitmask;
 			return 0;
@@ -265,7 +265,7 @@ __device__ inttype STOREINCACHE(volatile inttype* t, inttype* d_q, inttype* addr
 			}
 			else {
 				for (bj = 0; bj < d_sv_nints-1; bj++) {
-					if (shared[CACHEOFFSET+bitmask+bj] != (t)[bj]) {
+					if (cache[bitmask+bj] != (t)[bj]) {
 						break;
 					}
 				}
@@ -276,10 +276,10 @@ __device__ inttype STOREINCACHE(volatile inttype* t, inttype* d_q, inttype* addr
 			}
 		}
 		if (!ISNEWINT(bi)) {
-			bj = atomicCAS((inttype *) &shared[CACHEOFFSET+bitmask+(d_sv_nints-1)], bi, t[d_sv_nints-1]);
+			bj = atomicCAS((inttype *) &cache[bitmask+(d_sv_nints-1)], bi, t[d_sv_nints-1]);
 			if (bi == bj) {
 				for (bk = 0; bk < d_sv_nints-1; bk++) {
-					shared[CACHEOFFSET+bitmask+bk] = t[bk];
+					cache[bitmask+bk] = t[bk];
 				}
 				*address = bitmask;
 				return 0;
@@ -296,7 +296,7 @@ __device__ inttype STOREINCACHE(volatile inttype* t, inttype* d_q, inttype* addr
 
 // Mark the state in the cache according to markNew
 // This function takes POR bit into account
-__device__ void MARKINCACHE(volatile inttype* t, inttype* d_q, int markNew) {
+__device__ void MARKINCACHE(volatile inttype* t, inttype* cache, int markNew) {
 	inttype bi, bj, bl, bitmask;
 	indextype hashtmp;
 	STRIPSTATE(t);
@@ -309,18 +309,18 @@ __device__ void MARKINCACHE(volatile inttype* t, inttype* d_q, int markNew) {
 	SETNEWSTATE(t);
 	bl = 0;
 	while (bl < CACHERETRYFREQ) {
-		bi = shared[CACHEOFFSET+bitmask+(d_sv_nints-1)];
+		bi = cache[bitmask+(d_sv_nints-1)];
 		if (COMPAREENTRIES(bi, t[d_sv_nints-1])) {
 			for (bj = 0; bj < d_sv_nints-1; bj++) {
-				if (shared[CACHEOFFSET+bitmask+bj] != (t)[bj]) {
+				if (cache[bitmask+bj] != (t)[bj]) {
 					break;
 				}
 			}
 			if (bj == d_sv_nints-1) {
 				if(markNew) {
-					shared[CACHEOFFSET+bitmask+(d_sv_nints-1)] = NEWINT(OTHERINT(shared[CACHEOFFSET+bitmask+(d_sv_nints-1)] & STATE_FLAGS_MASK));
+					cache[bitmask+(d_sv_nints-1)] = NEWINT(OTHERINT(cache[bitmask+(d_sv_nints-1)] & STATE_FLAGS_MASK));
 				} else if(ISPORINT(bi) && ISNEWINT(bi)){
-					atomicCAS((inttype*) &shared[CACHEOFFSET+bitmask+(d_sv_nints-1)], bi, OLDINT(bi));
+					atomicCAS((inttype*) &cache[bitmask+(d_sv_nints-1)], bi, OLDINT(bi));
 				}
 				return;
 			}
@@ -741,13 +741,13 @@ __device__ void store_cache_overflow_warp(inttype *d_q, volatile inttype *d_news
 	}
 }
 
-__device__ void copy_cache_to_global(inttype *d_q, volatile inttype *d_newstate_flags) {
+__device__ void copy_cache_to_global(inttype *d_q, inttype* cache, volatile inttype *d_newstate_flags) {
 	int k = (d_shared_q_size-CACHEOFFSET)/d_sv_nints;
 	for (int i = WARP_ID; i * WARPSIZE < k; i += (blockDim.x / WARPSIZE)) {
-		int have_new_state = i * WARPSIZE + LANE < k && ISNEWSTATE(&shared[CACHEOFFSET+(i*WARPSIZE+LANE)*d_sv_nints]);
+		int have_new_state = i * WARPSIZE + LANE < k && ISNEWSTATE(&cache[(i*WARPSIZE+LANE)*d_sv_nints]);
 		while (int c = __ballot(have_new_state)) {
 			int active_lane = __ffs(c) - 1;
-			if(FINDORPUT_WARP((inttype*) &shared[CACHEOFFSET + (i*WARPSIZE+active_lane)*d_sv_nints], d_q, d_newstate_flags, 1) == 0) {
+			if(FINDORPUT_WARP((inttype*) &cache[(i*WARPSIZE+active_lane)*d_sv_nints], d_q, d_newstate_flags, 1) == 0) {
 				CONTINUE = 2;
 			}
 			if (LANE == active_lane) {
@@ -788,8 +788,10 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 	inttype i, k, l, index, offset1, offset2, tmp, cont, act, sync_offset1, sync_offset2;
 	volatile inttype* src_state = &shared[OPENTILEOFFSET+d_sv_nints*GROUP_GID];
 	volatile inttype* tgt_state = &shared[TGTSTATEOFFSET+threadIdx.x*d_sv_nints];
-	inttype bitmask, bi, bj;
+	inttype* cache = (inttype*) &shared[CACHEOFFSET];
+	inttype bitmask, bi;
 	int pos;
+	int tbgs = THREADBUFFERGROUPSTART(threadIdx.x);
 	// TODO: remove this
 	inttype TMPVAR;
 	// is at least one outgoing transition enabled for a given state (needed to detect deadlocks)
@@ -818,7 +820,7 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 	// Clean the cache
 	i = threadIdx.x;
 	while (i < (d_shared_q_size - CACHEOFFSET)) {
-		shared[CACHEOFFSET + i] = EMPTYVECT32;
+		cache[i] = EMPTYVECT32;
 		i += blockDim.x;
 	}
 	if(scan) {
@@ -980,7 +982,7 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 								num_trans++;
 								// store tgt_state in cache
 								// if k == 8, cache is full, immediately store in global hash table
-								k = STOREINCACHE(tgt_state, d_q, &bi);
+								k = STOREINCACHE(tgt_state, cache, &bi);
 							} else {
 								i = 1;
 							}
@@ -1087,7 +1089,7 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 						num_trans++;
 						// store tgt_state in cache; if i == d_shared_q_size, state was found, duplicate detected
 						// if i == d_shared_q_size+1, cache is full, immediately store in global hash table
-						TMPVAR = STOREINCACHE(tgt_state, d_q, &bitmask);
+						TMPVAR = STOREINCACHE(tgt_state, cache, &bitmask);
 						l = 1;
 						k = has_second_succ;
 						if(!has_second_succ) {
@@ -1188,7 +1190,7 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		__syncthreads();
 		// start scanning the local cache and write results to the global hash table
 		if(performed_work) {
-			copy_cache_to_global(d_q, d_newstate_flags);
+			copy_cache_to_global(d_q, cache, d_newstate_flags);
 		}
 		__syncthreads();
 		// Ready to start next iteration, if error has not occurred
@@ -1231,8 +1233,10 @@ gather_por(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 	inttype i, k, l, index, offset1, offset2, tmp, cont, act, sync_offset1, sync_offset2;
 	volatile inttype* src_state = &shared[OPENTILEOFFSET+d_sv_nints*GROUP_GID];
 	volatile inttype* tgt_state = &shared[TGTSTATEOFFSET+threadIdx.x*d_sv_nints];
+	inttype* cache = (inttype*) &shared[CACHEOFFSET];
 	inttype bitmask, bi, bj;
 	int pos;
+	int tbgs = THREADBUFFERGROUPSTART(threadIdx.x);
 	// TODO: remove this
 	inttype TMPVAR;
 	// is at least one outgoing transition enabled for a given state (needed to detect deadlocks)
@@ -1261,7 +1265,7 @@ gather_por(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 	// Clean the cache
 	i = threadIdx.x;
 	while (i < (d_shared_q_size - CACHEOFFSET)) {
-		shared[CACHEOFFSET + i] = EMPTYVECT32;
+		cache[i] = EMPTYVECT32;
 		i += blockDim.x;
 	}
 	if(scan) {
@@ -1437,14 +1441,14 @@ gather_por(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 									// store tgt_state in cache
 									// if k == 8, cache is full, immediately store in global hash table
 									if(generate == 1) {
-										k = STOREINCACHE(tgt_state, d_q, &bi);
+										k = STOREINCACHE(tgt_state, cache, &bi);
 										if(k >> 2) {
 											proviso_satisfied |= (k >> 1) & 1;
 										} else if (!d_check_cycle_proviso) {
-											SETPORSTATE(&shared[CACHEOFFSET + bi]);
+											SETPORSTATE(&cache[bi]);
 										}
 									} else {
-										MARKINCACHE(tgt_state, d_q, (THREADGROUPPOR >> GROUP_ID) & 1);
+										MARKINCACHE(tgt_state, cache, (THREADGROUPPOR >> GROUP_ID) & 1);
 									}
 								} else {
 									i = 1;
@@ -1455,7 +1459,7 @@ gather_por(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 							while(generate && d_check_cycle_proviso && (c = __ballot(i == 0 && (k >> 2 == 0)))) {
 								int active_lane = __ffs(c) - 1;
 								int cache_index = __shfl(bi, active_lane);
-								bj = FIND_WARP((inttype*) &shared[CACHEOFFSET + cache_index], d_q);
+								bj = FIND_WARP((inttype*) &cache[cache_index], d_q);
 								if(LANE == active_lane) {
 									i = 1;
 									if(bj == 0) {
@@ -1570,14 +1574,14 @@ gather_por(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 							// store tgt_state in cache; if i == d_shared_q_size, state was found, duplicate detected
 							// if i == d_shared_q_size+1, cache is full, immediately store in global hash table
 							if(generate == 1) {
-								TMPVAR = STOREINCACHE(tgt_state, d_q, &bitmask);
+								TMPVAR = STOREINCACHE(tgt_state, cache, &bitmask);
 								if(TMPVAR >> 2) {
 									rule_proviso |= (TMPVAR >> 1) & 1;
 								} else if (!d_check_cycle_proviso) {
-									SETPORSTATE(&shared[CACHEOFFSET + bitmask]);
+									SETPORSTATE(&cache[bitmask]);
 								}
 							} else {
-								MARKINCACHE(tgt_state, d_q, (THREADGROUPPOR & tmp) == tmp);
+								MARKINCACHE(tgt_state, cache, (THREADGROUPPOR & tmp) == tmp);
 							}
 							l = 1;
 							k = has_second_succ;
@@ -1590,7 +1594,7 @@ gather_por(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 						while(generate && d_check_cycle_proviso && (c = __ballot(l && (TMPVAR >> 2 == 0)))) {
 							int active_lane = __ffs(c) - 1;
 							int cache_index = __shfl(bitmask, active_lane);
-							bj = FIND_WARP((inttype*) &shared[CACHEOFFSET + cache_index], d_q);
+							bj = FIND_WARP((inttype*) &cache[cache_index], d_q);
 							if(LANE == active_lane) {
 								l = 0;
 								if(bj == 0) {
@@ -1744,7 +1748,7 @@ gather_por(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		__syncthreads();
 		// start scanning the local cache and write results to the global hash table
 		if(performed_work) {
-			copy_cache_to_global(d_q, d_newstate_flags);
+			copy_cache_to_global(d_q, cache, d_newstate_flags);
 		}
 		__syncthreads();
 		// Ready to start next iteration, if error has not occurred
