@@ -1819,9 +1819,33 @@ int main(int argc, char** argv) {
 	// GPU datastructures for calculation
 	inttype *d_q;
 
+	const char* help_text =
+		"Usage: GPUexplore <model> [OPTIONS]\n"
+		"Run state-space exploration on model (do not include the file extension).\n"
+		"options:\n"
+		"  -d                 Check for deadlocks\n"
+		"  -p                 Check a safety property (should be embedded in the model)\n"
+		"  --por              Apply partial-order reduction\n"
+		"  --cycle-proviso    Apply the cycle proviso during partial-order reduction\n"
+		"  -k NUM             Run NUM iterations per kernel launch (default 1)\n"
+		"  -b NUM             Run the kernel on NUM blocks (default 1)\n"
+		"  -t NUM             Use NUM threads per block (default 32)\n"
+		"  -q NUM             Allocate NUM integers for the hash table\n"
+		"  --dump FILE        Dump the state space to FILE after completing the exploration\n"
+		"  -v NUM             Change the verbosity:\n"
+		"                        0 - minimal output\n"
+		"                        1 - print sequence number of each kernel launch\n"
+		"                        2 - print number of states in the hash table after each kernel launch\n"
+		"                        3 - print state vectors after each kernel launch\n"
+		"  -h, --help         Show this help message\n";
+
 	if (argc == 1) {
 		fprintf(stderr, "ERROR: No input network given!\n");
+		fprintf(stdout, help_text);
 		exit(1);
+	} else if(!strcmp(argv[1],"--help") || !strcmp(argv[1],"-h") || !strcmp(argv[1],"-?")) {
+		fprintf(stdout, help_text);
+		exit(0);
 	}
 
 	strcpy(fn, argv[1]);
@@ -1829,8 +1853,11 @@ int main(int argc, char** argv) {
 
 	int i = 2;
 	while (i < argc) {
-		printf ("%s\n", argv[i]);
-		if (!strcmp(argv[i],"-k")) {
+		if (!strcmp(argv[i],"--help") || !strcmp(argv[i],"-h") || !strcmp(argv[i],"-?")) {
+			fprintf(stdout, help_text);
+			exit(0);
+		}
+		else if (!strcmp(argv[i],"-k")) {
 			// if nr. of iterations per kernel run is given, store it
 			kernel_iters = atoi(argv[i+1]);
 			i += 2;
@@ -1885,6 +1912,10 @@ int main(int argc, char** argv) {
 		else if (!strcmp(argv[i],"--dump")) {
 			dump_file = argv[i+1];
 			i += 2;
+		} else {
+			fprintf(stderr, "ERROR: unrecognized option %s\n", argv[i]);
+			fprintf(stdout, help_text);
+			exit(1);
 		}
 	}
 
