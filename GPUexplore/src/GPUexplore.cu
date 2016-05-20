@@ -2142,6 +2142,10 @@ int main(int argc, char** argv) {
 	inttype scan = 0;
 	CUDA_CHECK_RETURN(cudaMemcpy(d_property_violation, &zero, sizeof(inttype), cudaMemcpyHostToDevice))
 	inttype property_violation = 0;
+
+	clock_t exploration_start;
+	assert((exploration_start = clock())!=-1);
+
 	while (contBFS == 1) {
 		CUDA_CHECK_RETURN(cudaMemcpy(d_contBFS, &zero, sizeof(inttype), cudaMemcpyHostToDevice))
 		if(apply_por) {
@@ -2180,6 +2184,8 @@ int main(int argc, char** argv) {
 	stop = clock();
 	runtime = (double) (stop-start)/CLOCKS_PER_SEC;
 	fprintf (stdout, "Run time: %f\n", runtime);
+	runtime = (double) (stop-exploration_start)/CLOCKS_PER_SEC;
+	fprintf(stdout, "Exploration time %f\n", runtime);
 
 	if (property_violation == 1) {
 		switch (check_property) {
