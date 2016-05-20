@@ -1792,6 +1792,7 @@ int main(int argc, char** argv) {
 	int use_cycle_proviso = 0;
 	// level of verbosity (1=print level progress)
 	int verbosity = 0;
+	char* dump_file = NULL;
 	// clock to measure time
 	clock_t start, stop;
 	double runtime = 0.0;
@@ -1880,6 +1881,10 @@ int main(int argc, char** argv) {
 				use_cycle_proviso = 1;
 			}
 			i += 1;
+		}
+		else if (!strcmp(argv[i],"--dump")) {
+			dump_file = argv[i+1];
+			i += 2;
 		}
 	}
 
@@ -2170,11 +2175,16 @@ int main(int argc, char** argv) {
 	fprintf (stdout, "nr. of states in hash table: %d\n", counted_states);
 
 	// Debugging functionality: print states to file
-//	FILE* fout;
-//	fout = fopen("/tmp/gpuexplore.debug", "w");
-//	cudaMemcpy(q_test, d_q, tablesize*sizeof(inttype), cudaMemcpyDeviceToHost);
-//	print_local_queue(fout, q_test, tablesize, firstbit_statevector, nr_procs, sv_nints);
-//	fclose(fout);
+	if(dump_file) {
+		FILE* fout;
+		if((fout = fopen(dump_file, "w")) != NULL) {
+			cudaMemcpy(q_test, d_q, tablesize*sizeof(inttype), cudaMemcpyDeviceToHost);
+			print_local_queue(fout, q_test, tablesize, firstbit_statevector, nr_procs, sv_nints, apply_por);
+			fclose(fout);
+		} else {
+			fprintf(stderr, "Could not open file to dump the state space\n");
+		}
+	}
 
 	return 0;
 }
