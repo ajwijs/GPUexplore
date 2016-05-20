@@ -1206,11 +1206,6 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		}
 		__syncthreads();
 	}
-	atomicAdd((inttype*)&CONTINUE, num_trans);
-	__syncthreads();
-	if(threadIdx.x == 0) {
-		atomicAdd(d_counted_trans, CONTINUE);
-	}
 
 	//Copy the work tile to global mem
 	if (threadIdx.x < OPENTILELEN+LASTSEARCHLEN) {
@@ -1764,11 +1759,6 @@ gather_por(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		}
 		__syncthreads();
 	}
-	atomicAdd((inttype*)&CONTINUE, num_trans);
-	__syncthreads();
-	if(threadIdx.x == 0) {
-		atomicAdd(d_counted_trans, CONTINUE);
-	}
 
 	//Copy the work tile to global mem
 	if (threadIdx.x < OPENTILELEN+LASTSEARCHLEN) {
@@ -2173,10 +2163,8 @@ int main(int argc, char** argv) {
 		fprintf (stderr, "ERROR: problem with hash table\n");
 	}
 
-	CUDA_CHECK_RETURN(cudaMemcpy(&counted_states, d_counted_states, sizeof(inttype), cudaMemcpyDeviceToHost));
-	fprintf (stdout, "nr. of trans: %d\n", counted_states);
 	CUDA_CHECK_RETURN(cudaMemset(d_counted_states, 0, sizeof(inttype)));
-	count_states<<<((int) prop.multiProcessorCount)*4, 512, 1>>>(d_q, d_counted_states);
+	count_states<<<((int) prop.multiProcessorCount)*8, 512, 1>>>(d_q, d_counted_states);
 	CUDA_CHECK_RETURN(cudaDeviceSynchronize());
 	CUDA_CHECK_RETURN(cudaMemcpy(&counted_states, d_counted_states, sizeof(inttype), cudaMemcpyDeviceToHost));
 	fprintf (stdout, "nr. of states in hash table: %d\n", counted_states);
