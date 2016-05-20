@@ -218,7 +218,7 @@ const size_t Mb = 1<<20;
 #define STRIPSTATE(t)							{(t)[(d_sv_nints-1)] = (t)[(d_sv_nints-1)] & STATE_FLAGS_MASK;}
 #define STRIPPEDSTATE(t, i)						((i == d_sv_nints-1) ? ((t)[i] & STATE_FLAGS_MASK) : (t)[i])
 #define STRIPPEDENTRY(t, i)						((i == d_sv_nints-1) ? ((t) & STATE_FLAGS_MASK) : (t))
-#define STRIPPEDENTRY_HOST(t, i)				((i == sv_nints-1) ? ((t) & STATE_FLAGS_MASK) : (t))
+#define STRIPPEDENTRY_HOST(t, i)				((i == sv_nints-1) ? ((t) & (apply_por ? 0x3FFFFFFF : 0x7FFFFFFF)) : (t))
 #define NEWSTATEPART(t, i)						(((i) == d_sv_nints-1) ? ((t)[d_sv_nints-1] | 0x80000000) : (t)[(i)])
 #define COMPAREENTRIES(t1, t2)					(((t1) & STATE_FLAGS_MASK) == ((t2) & STATE_FLAGS_MASK))
 #define OWNSSYNCRULE(a, t, i)					{if (GETBIT((i),(t))) { \
@@ -569,7 +569,7 @@ int cudaMallocCount ( void ** ptr,int size) {
 }
 
 //test function to print a given state vector
-void print_statevector(FILE* stream, inttype *state, inttype *firstbit_statevector, inttype nr_procs, inttype sv_nints) {
+void print_statevector(FILE* stream, inttype *state, inttype *firstbit_statevector, inttype nr_procs, inttype sv_nints, inttype apply_por) {
 	inttype i, s, bitmask;
 
 	for (i = 0; i < nr_procs; i++) {
@@ -596,7 +596,7 @@ void print_statevector(FILE* stream, inttype *state, inttype *firstbit_statevect
 }
 
 //test function to print the contents of the device queue
-void print_queue(inttype *d_q, inttype q_size, inttype *firstbit_statevector, inttype nr_procs, inttype sv_nints) {
+void print_queue(inttype *d_q, inttype q_size, inttype *firstbit_statevector, inttype nr_procs, inttype sv_nints, inttype apply_por) {
 	inttype *q_test = (inttype*) malloc(sizeof(inttype)*q_size);
 	cudaMemcpy(q_test, d_q, q_size*sizeof(inttype), cudaMemcpyDeviceToHost);
 	inttype nw;
@@ -611,7 +611,7 @@ void print_queue(inttype *d_q, inttype q_size, inttype *firstbit_statevector, in
 					newcount++;
 					fprintf (stdout, "new: ");
 				}
-				print_statevector(stdout, &(q_test[(i*WARPSIZE)+STARTPOS_OF_EL_IN_BUCKET_HOST(j)]), firstbit_statevector, nr_procs, sv_nints);
+				print_statevector(stdout, &(q_test[(i*WARPSIZE)+STARTPOS_OF_EL_IN_BUCKET_HOST(j)]), firstbit_statevector, nr_procs, sv_nints, apply_por);
 			}
 		}
 	}
@@ -619,7 +619,7 @@ void print_queue(inttype *d_q, inttype q_size, inttype *firstbit_statevector, in
 }
 
 //test function to print the contents of the device queue
-void print_local_queue(FILE* stream, inttype *q, inttype q_size, inttype *firstbit_statevector, inttype nr_procs, inttype sv_nints) {
+void print_local_queue(FILE* stream, inttype *q, inttype q_size, inttype *firstbit_statevector, inttype nr_procs, inttype sv_nints, inttype apply_por) {
 	int count = 0, newcount = 0;
 	inttype nw;
 	for (inttype i = 0; i < (q_size/WARPSIZE); i++) {
@@ -632,7 +632,7 @@ void print_local_queue(FILE* stream, inttype *q, inttype q_size, inttype *firstb
 					newcount++;
 					fprintf (stream, "new: ");
 				}
-				print_statevector(stream, &(q[(i*WARPSIZE)+STARTPOS_OF_EL_IN_BUCKET_HOST(j)]), firstbit_statevector, nr_procs, sv_nints);
+				print_statevector(stream, &(q[(i*WARPSIZE)+STARTPOS_OF_EL_IN_BUCKET_HOST(j)]), firstbit_statevector, nr_procs, sv_nints, apply_por);
 			}
 		}
 	}
@@ -2145,7 +2145,7 @@ int main(int argc, char** argv) {
 			}
 			else if (verbosity == 3) {
 				cudaMemcpy(q_test, d_q, tablesize*sizeof(inttype), cudaMemcpyDeviceToHost);
-				print_local_queue(stdout, q_test, tablesize, firstbit_statevector, nr_procs, sv_nints);
+				print_local_queue(stdout, q_test, tablesize, firstbit_statevector, nr_procs, sv_nints, apply_por);
 			}
 		}
 		scan = 1;
