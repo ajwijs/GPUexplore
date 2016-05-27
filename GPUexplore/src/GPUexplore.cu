@@ -295,7 +295,8 @@ __device__ inttype STOREINCACHE(volatile inttype* t, inttype* cache, inttype* ad
 }
 
 // Mark the state in the cache according to markNew
-// This function takes POR bit into account
+// This function is used while applying POR to decide whether the cycle proviso
+// is satisfied.
 __device__ void MARKINCACHE(volatile inttype* t, inttype* cache, int markNew) {
 	inttype bi, bj, bl, bitmask;
 	indextype hashtmp;
@@ -709,6 +710,9 @@ __global__ void store_initial(inttype *d_q, inttype *d_h, inttype *d_newstate_fl
 	d_newstate_flags[(hashtmp / blockdim) % griddim] = 1;
 }
 
+/**
+ * Kernel that counts the amount of states in global memory
+ */
 __global__ void count_states(inttype *d_q, inttype *result) {
 	if(threadIdx.x == 0) {
 		shared[0] = 0;
@@ -728,6 +732,7 @@ __global__ void count_states(inttype *d_q, inttype *result) {
 	}
 }
 
+// When the cache overflows, use the whole warp to store states to global memory
 __device__ void store_cache_overflow_warp(inttype *d_q, volatile inttype *d_newstate_flags, int has_overflow) {
 	while(int c = __ballot(has_overflow)) {
 		int active_lane = __ffs(c) - 1;
@@ -741,6 +746,7 @@ __device__ void store_cache_overflow_warp(inttype *d_q, volatile inttype *d_news
 	}
 }
 
+// Copy all states from the cache to global memory
 __device__ void copy_cache_to_global(inttype *d_q, inttype* cache, volatile inttype *d_newstate_flags) {
 	int k = (d_shared_q_size-CACHEOFFSET)/d_sv_nints;
 	for (int i = WARP_ID; i * WARPSIZE < k; i += (blockDim.x / WARPSIZE)) {
@@ -783,8 +789,6 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 						inttype *d_proc_offsets, inttype *d_proc_trans, inttype *d_syncbits_offsets,
 						inttype *d_syncbits, inttype *d_contBFS, inttype *d_property_violation,
 						volatile inttype *d_newstate_flags, inttype *d_worktiles, inttype *d_counted_trans, inttype scan) {
-	//inttype global_id = (blockIdx.x * blockDim.x) + threadIdx.x;
-	//inttype group_nr = threadIdx.x / nr_procs;
 	inttype i, k, l, index, offset1, offset2, tmp, cont, act, sync_offset1, sync_offset2;
 	volatile inttype* src_state = &shared[OPENTILEOFFSET+d_sv_nints*GROUP_GID];
 	volatile inttype* tgt_state = &shared[TGTSTATEOFFSET+threadIdx.x*d_sv_nints];
@@ -1023,7 +1027,6 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 			// Now, we have obtained the info needed to combine process transitions
 			sync_offset1 = sync_offset2 = 0;
 			int proc_enabled = (__ballot(act == sync_act) >> (LANE - GROUP_ID)) & ((1 << d_nr_procs) - 1);
-			//&& (__popc(proc_enabled) >= 2)
 			if(THREADINGROUP && sync_act < (1 << d_bits_act) && (__popc(proc_enabled) >= 2)) {
 				// syncbits Offset position
 				i = sync_act/(INTSIZE/d_nbits_syncbits_offset);
@@ -1223,8 +1226,6 @@ gather_por(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 						inttype *d_proc_offsets, inttype *d_proc_trans, inttype *d_syncbits_offsets,
 						inttype *d_syncbits, inttype *d_contBFS, inttype *d_property_violation,
 						volatile inttype *d_newstate_flags, inttype *d_worktiles, inttype *d_counted_trans, inttype scan) {
-	//inttype global_id = (blockIdx.x * blockDim.x) + threadIdx.x;
-	//inttype group_nr = threadIdx.x / nr_procs;
 	inttype i, k, l, index, offset1, offset2, tmp, cont, act, sync_offset1, sync_offset2;
 	volatile inttype* src_state = &shared[OPENTILEOFFSET+d_sv_nints*GROUP_GID];
 	volatile inttype* tgt_state = &shared[TGTSTATEOFFSET+threadIdx.x*d_sv_nints];
@@ -1451,6 +1452,7 @@ gather_por(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 							}
 							store_cache_overflow_warp(d_q, d_newstate_flags, i == 0 && k == 8);
 							int c;
+							// Check cycle proviso with the whole warp
 							while(generate && d_check_cycle_proviso && (c = __ballot(i == 0 && (k >> 2 == 0)))) {
 								int active_lane = __ffs(c) - 1;
 								int cache_index = __shfl(bi, active_lane);
@@ -1497,7 +1499,6 @@ gather_por(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 				// Now, we have obtained the info needed to combine process transitions
 				sync_offset1 = sync_offset2 = 0;
 				int proc_enabled = (__ballot(act == sync_act) >> (LANE - GROUP_ID)) & ((1 << d_nr_procs) - 1);
-				//&& (__popc(proc_enabled) >= 2)
 				if(THREADINGROUP && sync_act < (1 << d_bits_act)) {
 					// syncbits Offset position
 					i = sync_act/(INTSIZE/d_nbits_syncbits_offset);
@@ -1586,6 +1587,7 @@ gather_por(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 						}
 						store_cache_overflow_warp(d_q, d_newstate_flags, l && TMPVAR == 8);
 						int c;
+						// Check cycle proviso with the whole warp
 						while(generate && d_check_cycle_proviso && (c = __ballot(l && (TMPVAR >> 2 == 0)))) {
 							int active_lane = __ffs(c) - 1;
 							int cache_index = __shfl(bitmask, active_lane);
@@ -1987,14 +1989,12 @@ int main(int argc, char** argv) {
 
 		fgets(stmp, BUFFERSIZE, fp);
 		nbits_syncbits_offset = atoi(stmp);
-		//fprintf(stdout, "size of offset in sync rules: %d\n", nbits_syncbits_offset);
 		fgets(stmp, BUFFERSIZE, fp);
 		nr_syncbits_offsets = atoi(stmp);
 		syncbits_offsets = (inttype*) malloc(sizeof(inttype)*nr_syncbits_offsets);
 		for (int i = 0; i < nr_syncbits_offsets; i++) {
 			fgets(stmp, BUFFERSIZE, fp);
 			syncbits_offsets[i] = atoi(stmp);
-			//fprintf(stdout, "syncbits offset %d: %d\n", i, syncbits_offsets[i]);
 		}
 		fgets(stmp, BUFFERSIZE, fp);
 		nr_syncbits = atoi(stmp);
@@ -2002,7 +2002,6 @@ int main(int argc, char** argv) {
 		for (int i = 0; i < nr_syncbits; i++) {
 			fgets(stmp, BUFFERSIZE, fp);
 			syncbits[i] = atoi(stmp);
-			//fprintf(stdout, "syncbits %d: %d\n", i, syncbits[i]);
 		}
 	}
 	else {
@@ -2011,27 +2010,10 @@ int main(int argc, char** argv) {
 	}
 
 	// Randomly define the closed set hash functions
-//	srand(time(NULL));
-//	for (int i = 0; i < NR_HASH_FUNCTIONS*2; i++) {
-//		h[i] = rand();
-//	}
-	// TODO: make random again
-	h[0] = 483319424;
-	h[1] = 118985421;
-	h[2] = 1287157904;
-	h[3] = 1162380012;
-	h[4] = 1231274815;
-	h[5] = 1344969351;
-	h[6] = 527997957;
-	h[7] = 735456672;
-	h[8] = 1774251664;
-	h[9] = 23102285;
-	h[10] = 2089529600;
-	h[11] = 2083003102;
-	h[12] = 908039861;
-	h[13] = 1913855526;
-	h[14] = 1515282600;
-	h[15] = 1691511413;
+	srand(time(NULL));
+	for (int i = 0; i < NR_HASH_FUNCTIONS*2; i++) {
+		h[i] = rand();
+	}
 
 	// continue flags
 	contBFS = 1;
@@ -2127,7 +2109,7 @@ int main(int argc, char** argv) {
 	cudaMemcpyToSymbol(d_apply_por, &apply_por, sizeof(inttype));
 	cudaMemcpyToSymbol(d_check_cycle_proviso, &use_cycle_proviso, sizeof(inttype));
 
-	// init the queue
+	// init the hash table
 	init_queue<<<nblocks, nthreadsperblock>>>(d_q, q_size);
 	store_initial<<<1,1>>>(d_q, d_h, d_newstate_flags,nthreadsperblock,nblocks);
 	for (int i = 0; i < 2*NR_HASH_FUNCTIONS; i++) {
@@ -2215,6 +2197,7 @@ int main(int argc, char** argv) {
 	if(dump_file) {
 		FILE* fout;
 		if((fout = fopen(dump_file, "w")) != NULL) {
+			fprintf(stdout, "Dumping state space to file...\n");
 			cudaMemcpy(q_test, d_q, tablesize*sizeof(inttype), cudaMemcpyDeviceToHost);
 			print_local_queue(fout, q_test, tablesize, firstbit_statevector, nr_procs, sv_nints, apply_por);
 			fclose(fout);
