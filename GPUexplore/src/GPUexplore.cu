@@ -901,7 +901,9 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		offset1 = 0;
 		offset2 = 0;
 		// Reset the whole thread buffer (shared + private)
-		for(i = THREADBUFFEROFFSET + threadIdx.x; i < THREADBUFFERLEN; i+=blockDim.x) {
+		int start = THREADBUFFEROFFSET;
+		int end = THREADBUFFEROFFSET + THREADBUFFERLEN;
+		for(i = start + threadIdx.x; i < end; i+=blockDim.x) {
 			shared[i] = 0;
 		}
 		if (THREADINGROUP) {
@@ -1328,7 +1330,9 @@ gather_por(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		offset1 = 0;
 		offset2 = 0;
 		// Reset the whole thread buffer (shared + private)
-		for(i = THREADBUFFEROFFSET + threadIdx.x; i < THREADBUFFERLEN; i+=blockDim.x) {
+		int start = THREADBUFFEROFFSET;
+		int end = THREADBUFFEROFFSET + THREADBUFFERLEN;
+		for(i = start + threadIdx.x; i < end; i+=blockDim.x) {
 			shared[i] = 0;
 		}
 		if (THREADINGROUP) {
