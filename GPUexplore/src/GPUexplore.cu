@@ -1248,16 +1248,9 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 	// is at least one outgoing transition enabled for a given state (needed to detect deadlocks)
 	inttype outtrans_enabled;
 
-	for (i = threadIdx.x; i < d_shared_q_size; i += blockDim.x) {
-		shared[i] = 0;
-	}
 	// Locally store the state sizes and syncbits
-	i = threadIdx.x;
-	if (i == 0) {
-		ITERATIONS = 0;
-		OPENTILECOUNT = 0;
-		WORKSCANRESULT = 0;
-		SCAN = 0;
+	if (threadIdx.x < SH_OFFSET) {
+		shared[threadIdx.x] = 0;
 	}
 	for (i = threadIdx.x; i < HASHCONSTANTSLEN; i += blockDim.x) {
 		shared[i+HASHCONSTANTSOFFSET] = d_h[i];
@@ -1269,10 +1262,8 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		shared[i+LTSSTATESIZEOFFSET] = d_bits_state[i];
 	}
 	// Clean the cache
-	i = threadIdx.x;
-	while (i < (d_shared_q_size - CACHEOFFSET)) {
+	for (i = threadIdx.x; i < (d_shared_q_size - CACHEOFFSET); i += blockDim.x) {
 		cache[i] = EMPTYVECT32;
-		i += blockDim.x;
 	}
 	if(scan) {
 		//Copy the work tile from global mem
@@ -1282,11 +1273,11 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		if(threadIdx.x == 0) {
 			OPENTILECOUNT = d_worktiles[(OPENTILELEN+LASTSEARCHLEN+1) * blockIdx.x + OPENTILELEN + LASTSEARCHLEN];
 		}
-	} else if (threadIdx.x < OPENTILELEN) {
-		shared[OPENTILEOFFSET+threadIdx.x] = EMPTYVECT32;
+	} else if (threadIdx.x < OPENTILELEN+LASTSEARCHLEN) {
+		// On first run: initialize the work tile to empty
+		shared[OPENTILEOFFSET+threadIdx.x] = threadIdx.x < OPENTILELEN ? EMPTYVECT32 : 0;
 	}
 	__syncthreads();
-	inttype last_search_location = shared[LASTSEARCHOFFSET + WARP_ID];
 	while (ITERATIONS < d_kernel_iters) {
 		if (threadIdx.x == 0 && OPENTILECOUNT < OPENTILELEN && d_newstate_flags[blockIdx.x]) {
 			// Indicate that we are scanning
@@ -1296,6 +1287,7 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		__syncthreads();
 		// Scan the open set for work; we use the OPENTILECOUNT flag at this stage to count retrieved elements
 		if (SCAN) {
+			inttype last_search_location = shared[LASTSEARCHOFFSET + WARP_ID];
 			// This block should be able to find a new state
 			int found_new_state = 0;
 			for (i = GLOBAL_WARP_ID; i < d_nrbuckets && OPENTILECOUNT < OPENTILELEN; i += NR_WARPS) {
