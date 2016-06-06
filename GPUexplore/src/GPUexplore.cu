@@ -866,7 +866,7 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		// while there is work to be done
 		outtrans_enabled = 0;
 		local_action_counter = 0;
-		while (CONTINUE != 2 && __any(offset1 < offset2 || cont)) {
+		while (CONTINUE != 2 && (__any(offset1 < offset2 || cont) || (d_apply_por && local_action_counter != -1))) {
 			if (offset1 < offset2 && !cont) {
 				// reset act
 				act = (1 << (d_bits_act));
