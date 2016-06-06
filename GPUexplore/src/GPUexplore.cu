@@ -1348,7 +1348,9 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		offset1 = 0;
 		offset2 = 0;
 		// Reset the whole thread buffer (shared + private)
-		for(i = THREADBUFFEROFFSET + threadIdx.x; i < THREADBUFFERLEN; i+=blockDim.x) {
+		int start = THREADBUFFEROFFSET;
+		int end = THREADBUFFEROFFSET + THREADBUFFERLEN;
+		for(i = start + threadIdx.x; i < end; i+=blockDim.x) {
 			shared[i] = 0;
 		}
 		if (THREADINGROUP) {
@@ -1372,6 +1374,7 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 					GETTRANSOFFSET(offset2, tmp, pos+1);
 				}
 			}
+
 		}
 		// iterate over the outgoing transitions of state 'cont'
 		// variable cont is reused to indicate whether the buffer content of this thread still needs processing
