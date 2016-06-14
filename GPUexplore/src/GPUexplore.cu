@@ -975,7 +975,7 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 				cont = 1;
 				i++;
 				offset1++;
-				while (offset1 < offset2) {
+				while (i < d_max_buf_ints && offset1 < offset2) {
 					tmp = tex1Dfetch(tex_proc_trans, offset1);
 					GETPROCTRANSACT(bitmask, tmp);
 					if (act == bitmask) {
