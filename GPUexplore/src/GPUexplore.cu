@@ -135,7 +135,6 @@ const size_t Mb = 1<<20;
 #define THREADBUFFERGROUPPOS(i, j)		shared[tbgs+THREADBUFFERSHARED+((i)*d_max_buf_ints)+(j)]
 #define THREADGROUPCOUNTER				shared[tbgs]
 #define THREADGROUPPOR					shared[tbgs + 1]
-#define OPENTILESTATEPART(i)			shared[OPENTILEOFFSET+(d_sv_nints*((WARP_ID*GROUPS_PER_WARP+(LANE / d_nr_procs))))+(i)]
 
 #define THREADINGROUP					(LANE < (GROUPS_PER_WARP)*d_nr_procs)
 
@@ -151,48 +150,43 @@ const size_t Mb = 1<<20;
 
 // BIT MANIPULATION MACROS
 
-#define SETBIT(i, x)							{(x) = ((1L<<(i)) | (x));}
-#define GETBIT(i, x)							(((x) >> (i)) & 1L)
-#define SETBITS(i, j, x)						{(x) = (x) | (((1L<<(j))-1)^((1L<<(i))-1));}
-#define GETPROCTRANSACT(a, t)					{bitmask = 0; SETBITS(1, 1+d_bits_act, bitmask); (a) = ((t) & bitmask) >> 1;}
+#define SETBIT(i, x)							{(x) = ((1<<(i)) | (x));}
+#define GETBIT(i, x)							(((x) >> (i)) & 1)
+#define SETBITS(i, j, x)						{(x) = (x) | (((1<<(j))-1)^((1<<(i))-1));}
+#define GETBITS(x, y, start, len)				{(x) = ((y) >> (start)) & ((1 << (len)) - 1);}
+#define GETPROCTRANSACT(a, t)					GETBITS(a, t, 1, d_bits_act)
 #define GETPROCTRANSSYNC(a, t)					{(a) = ((t) & 1);}
-#define GETPROCTRANSSTATE(a, t, i, j)			{bitmask = (1 << shared[LTSSTATESIZEOFFSET+(j)]) - 1; \
-												 (a) = ((t) >> 1+d_bits_act+(i)*shared[LTSSTATESIZEOFFSET+(j)]) & bitmask; \
-												}
-#define GETTRANSOFFSET(a, t, i)					{bitmask = 0; SETBITS((i)*d_nbits_offset, ((i)+1)*d_nbits_offset, bitmask); (a) = ((t) & bitmask) >> ((i)*d_nbits_offset);}
-#define GETSYNCOFFSET(a, t, i)					{bitmask = 0; SETBITS((i)*d_nbits_syncbits_offset, ((i)+1)*d_nbits_syncbits_offset, bitmask); \
-													(a) = ((t) & bitmask) >> ((i)*d_nbits_syncbits_offset);}
-#define GETSTATEVECTORSTATE(a, t, i)			{bitmask = 0; 	if (shared[VECTORPOSOFFSET+(i)]/INTSIZE == (shared[VECTORPOSOFFSET+(i)+1]-1)/INTSIZE) { \
-																	SETBITS((shared[VECTORPOSOFFSET+(i)] % INTSIZE), \
-																			(((shared[VECTORPOSOFFSET+(i)+1]-1) % INTSIZE)+1), bitmask); \
-																	(a) = ((t)[shared[VECTORPOSOFFSET+(i)]/INTSIZE] & bitmask) >> (shared[VECTORPOSOFFSET+(i)] % INTSIZE); \
+#define GETPROCTRANSSTATE(a, t, i, j)			GETBITS(a, t, 1+d_bits_act+(i)*STATESIZE(j), STATESIZE(j))
+#define GETTRANSOFFSET(a, t, i)					GETBITS(a, t, (i)*d_nbits_offset, d_nbits_offset)
+#define GETSYNCOFFSET(a, t, i)					GETBITS(a, t, (i)*d_nbits_syncbits_offset, d_nbits_syncbits_offset)
+//GETBITS(a, (t)[shared[VECTORPOSOFFSET+(i)]/INTSIZE], \
+//		shared[VECTORPOSOFFSET+(i)] % INTSIZE, shared[LTSSTATESIZEOFFSET+(i)]);
+#define GETSTATEVECTORSTATE(a, t, i)			{bitmask = 0; 	if (VECTORSTATEPOS(i)/INTSIZE == (VECTORSTATEPOS((i)+1)-1)/INTSIZE) { \
+																	SETBITS((VECTORSTATEPOS(i) % INTSIZE), \
+																			(((VECTORSTATEPOS((i)+1)-1) % INTSIZE)+1), bitmask); \
+																	(a) = ((t)[VECTORSTATEPOS(i)/INTSIZE] & bitmask) >> (VECTORSTATEPOS(i) % INTSIZE); \
 																} \
 																else { \
-																	SETBITS(0,(shared[VECTORPOSOFFSET+(i)+1] % INTSIZE),bitmask); \
-																	(a) = (t)[shared[VECTORPOSOFFSET+(i)]/INTSIZE] >> (shared[VECTORPOSOFFSET+(i)] % INTSIZE) \
+																	SETBITS(0,(VECTORSTATEPOS((i)+1) % INTSIZE),bitmask); \
+																	(a) = (t)[VECTORSTATEPOS(i)/INTSIZE] >> (VECTORSTATEPOS(i) % INTSIZE) \
 																		 | \
-																		((t)[shared[VECTORPOSOFFSET+(i)+1]/INTSIZE] & bitmask) << \
-																		(INTSIZE - (shared[VECTORPOSOFFSET+(i)] % INTSIZE)); \
+																		((t)[VECTORSTATEPOS((i)+1)/INTSIZE] & bitmask) << \
+																		(INTSIZE - (VECTORSTATEPOS(i) % INTSIZE)); \
 																} \
 												}
-#define SETPROCTRANSACT(t, x)					{bitmask = 0; SETBITS(1, d_bits_act+1,bitmask); (t) = ((t) & ~bitmask) | ((x) << 1);}
-#define SETPROCTRANSSYNC(t, x)					{(t) = ((t) & ~1) | (x);}
-#define SETPROCTRANSSTATE(t, i, x, j)			{bitmask = 0; SETBITS(1+d_bits_act+((i)-1)*shared[LTSSTATESIZEOFFSET+(j)],1+d_bits_act+(i)*shared[LTSSTATESIZEOFFSET+(j)],bitmask); \
-													(t) = ((t) & ~bitmask) | ((x) << (1+d_bits_act+((i)-1)*shared[LTSSTATESIZEOFFSET+(j)]));}
-#define SETSTATEVECTORSTATE(t, i, x)			{bitmask = 0; 	if (shared[VECTORPOSOFFSET+(i)]/INTSIZE == (shared[VECTORPOSOFFSET+(i)+1]-1)/INTSIZE) { \
-																	SETBITS((shared[VECTORPOSOFFSET+(i)] % INTSIZE), \
-																			(((shared[VECTORPOSOFFSET+(i)+1]-1) % INTSIZE)+1),bitmask); \
-																	(t)[shared[VECTORPOSOFFSET+(i)]/INTSIZE] = ((t)[shared[VECTORPOSOFFSET+(i)]/INTSIZE] & ~bitmask) | \
-																	((x) << (shared[VECTORPOSOFFSET+(i)] % INTSIZE)); \
+#define SETSTATEVECTORSTATE(t, i, x)			{bitmask = 0; 	if (VECTORSTATEPOS(i)/INTSIZE == (VECTORSTATEPOS((i)+1)-1)/INTSIZE) { \
+																	SETBITS((VECTORSTATEPOS(i) % INTSIZE), \
+																			(((VECTORSTATEPOS((i)+1)-1) % INTSIZE)+1),bitmask); \
+																	(t)[VECTORSTATEPOS(i)/INTSIZE] = ((t)[VECTORSTATEPOS(i)/INTSIZE] & ~bitmask) | \
+																	((x) << (VECTORSTATEPOS(i) % INTSIZE)); \
 																} \
 																else { \
-																	SETBITS(0,(shared[VECTORPOSOFFSET+(i)] % INTSIZE), bitmask); \
-																	(t)[shared[VECTORPOSOFFSET+(i)]/INTSIZE] = ((t)[shared[VECTORPOSOFFSET+(i)]/INTSIZE] & bitmask) | \
-																	((x) << (shared[VECTORPOSOFFSET+(i)] % INTSIZE)); \
-																	bitmask = 0; \
-																	SETBITS((shared[VECTORPOSOFFSET+(i)+1] % INTSIZE), INTSIZE, bitmask); \
-																	(t)[shared[VECTORPOSOFFSET+(i)+1]/INTSIZE] = ((t)[shared[VECTORPOSOFFSET+(i)+1]/INTSIZE] & bitmask) | \
-																		((x) >> (INTSIZE - (shared[VECTORPOSOFFSET+(i)] % INTSIZE))); \
+																	SETBITS(0,(VECTORSTATEPOS(i) % INTSIZE), bitmask); \
+																	(t)[VECTORSTATEPOS(i)/INTSIZE] = ((t)[VECTORSTATEPOS(i)/INTSIZE] & bitmask) | \
+																	((x) << (VECTORSTATEPOS(i) % INTSIZE)); \
+																	bitmask = -1 << (VECTORSTATEPOS((i)+1) % INTSIZE); \
+																	(t)[VECTORSTATEPOS((i)+1)/INTSIZE] = ((t)[VECTORSTATEPOS((i)+1)/INTSIZE] & bitmask) | \
+																		((x) >> (INTSIZE - (VECTORSTATEPOS(i) % INTSIZE))); \
 																} \
 												}
 // NEEDS FIX: USE BIT 32 OF FIRST INTEGER TO INDICATE STATE OR NOT (1 or 0), IN CASE MULTIPLE INTEGERS ARE USED FOR STATE VECTOR!!!
@@ -221,18 +215,7 @@ const size_t Mb = 1<<20;
 #define STRIPPEDENTRY_HOST(t, i)				((i == sv_nints-1) ? ((t) & (apply_por ? 0x3FFFFFFF : 0x7FFFFFFF)) : (t))
 #define NEWSTATEPART(t, i)						(((i) == d_sv_nints-1) ? ((t)[d_sv_nints-1] | 0x80000000) : (t)[(i)])
 #define COMPAREENTRIES(t1, t2)					(((t1) & STATE_FLAGS_MASK) == ((t2) & STATE_FLAGS_MASK))
-#define OWNSSYNCRULE(a, t, i)					{if (GETBIT((i),(t))) { \
-													bitmask = 0; SETBITS(0,(i),bitmask); if ((t & bitmask) > 0) {(a) = 0;} else {(a) = 1;}} \
-													else {(a) = 0;}}
-#define GETSYNCRULE(a, t, i)					{bitmask = 0; SETBITS((i)*d_nr_procs,((i)+1)*d_nr_procs,bitmask); (a) = ((t) & bitmask) >> ((i)*d_nr_procs);}
-#define SYNCRULEISAPPLICABLE(a, t, ac)			{(a) = 1; \
-												 for (int rule = (t); rule && a;) { \
-													bk = __ffs(rule) - 1; \
-													bj = THREADBUFFERGROUPPOS((inttype) bk,0); \
-													(a) = bj == 0 ? 0 : ((bj >> 1) & ((1 << d_bits_act) - 1)) == (ac); \
-													rule &= ~(1 << bk); \
-												 } \
-												}
+#define GETSYNCRULE(a, t, i)					GETBITS(a, t, (i)*d_nr_procs, d_nr_procs)
 
 // HASH TABLE MACROS
 
@@ -809,10 +792,10 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		shared[i+HASHCONSTANTSOFFSET] = d_h[i];
 	}
 	for (i = threadIdx.x; i < VECTORPOSLEN; i += blockDim.x) {
-		shared[i+VECTORPOSOFFSET] = d_firstbit_statevector[i];
+		VECTORSTATEPOS(i) = d_firstbit_statevector[i];
 	}
 	for (i = threadIdx.x; i < LTSSTATESIZELEN; i += blockDim.x) {
-		shared[i+LTSSTATESIZEOFFSET] = d_bits_state[i];
+		STATESIZE(i) = d_bits_state[i];
 	}
 	// Clean the cache
 	for (i = threadIdx.x; i < (d_shared_q_size - CACHEOFFSET); i += blockDim.x) {
@@ -1238,10 +1221,10 @@ gather_por(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		shared[i+HASHCONSTANTSOFFSET] = d_h[i];
 	}
 	for (i = threadIdx.x; i < VECTORPOSLEN; i += blockDim.x) {
-		shared[i+VECTORPOSOFFSET] = d_firstbit_statevector[i];
+		VECTORSTATEPOS(i) = d_firstbit_statevector[i];
 	}
 	for (i = threadIdx.x; i < LTSSTATESIZELEN; i += blockDim.x) {
-		shared[i+LTSSTATESIZEOFFSET] = d_bits_state[i];
+		STATESIZE(i) = d_bits_state[i];
 	}
 	// Clean the cache
 	for (i = threadIdx.x; i < (d_shared_q_size - CACHEOFFSET); i += blockDim.x) {
