@@ -915,67 +915,60 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		cont = 0;
 		// while there is work to be done
 		outtrans_enabled = 0;
-		while (CONTINUE != 2 && __any(offset1 < offset2 || cont)) {
-			if (offset1 < offset2 && !cont) {
-				// reset act
-				act = (1 << (d_bits_act));
-				// reset buffer of this thread
-				for (l = 0; l < d_max_buf_ints; l++) {
-					THREADBUFFERGROUPPOS(GROUP_ID, l) = 0;
-				}
+		// if not sync, store in hash table
+		// loop over all transentries
+		while (1) {
+			i = 1;
+			if(offset1 < offset2  && !cont) {
+				tmp = tex1Dfetch(tex_proc_trans, offset1);
+				GETPROCTRANSSYNC(i, tmp);
 			}
-			// if not sync, store in hash table
-			// loop over all transentries
-			while (1) {
-				i = 1;
-				if(offset1 < offset2  && !cont) {
-					tmp = tex1Dfetch(tex_proc_trans, offset1);
-					GETPROCTRANSSYNC(i, tmp);
-				}
-				if (__any(i == 0)) {
-					if(i == 0) {
-						// no deadlock
-						outtrans_enabled = 1;
-						// construct state
-						for (l = 0; l < d_sv_nints; l++) {
-							tgt_state[l] = src_state[l];
-						}
-						offset1++;
+			if (__any(i == 0)) {
+				if(i == 0) {
+					// no deadlock
+					outtrans_enabled = 1;
+					// construct state
+					for (l = 0; l < d_sv_nints; l++) {
+						tgt_state[l] = src_state[l];
 					}
-					// loop over this transentry
-					for (l = 0; __any(i == 0 && l < NR_OF_STATES_IN_TRANSENTRY(GROUP_ID)); l++) {
-						if(i == 0) {
-							GETPROCTRANSSTATE(pos, tmp, l, GROUP_ID);
-							if (pos > 0) {
-								SETSTATEVECTORSTATE(tgt_state, GROUP_ID, pos-1);
-								// check for violation of safety property, if required
-								if (d_property == SAFETY) {
-									if (GROUP_ID == d_nr_procs-1) {
-										// pos contains state id + 1
-										// error state is state 1
-										if (pos == 2) {
-											// error state found
-											(*d_property_violation) = 1;
-										}
+					offset1++;
+				}
+				// loop over this transentry
+				for (l = 0; __any(i == 0 && l < NR_OF_STATES_IN_TRANSENTRY(GROUP_ID)); l++) {
+					if(i == 0) {
+						GETPROCTRANSSTATE(pos, tmp, l, GROUP_ID);
+						if (pos > 0) {
+							SETSTATEVECTORSTATE(tgt_state, GROUP_ID, pos-1);
+							// check for violation of safety property, if required
+							if (d_property == SAFETY) {
+								if (GROUP_ID == d_nr_procs-1) {
+									// pos contains state id + 1
+									// error state is state 1
+									if (pos == 2) {
+										// error state found
+										(*d_property_violation) = 1;
 									}
 								}
-								// store tgt_state in cache
-								// if k == 8, cache is full, immediately store in global hash table
-								k = STOREINCACHE(tgt_state, cache, &bi);
-							} else {
-								i = 1;
 							}
+							// store tgt_state in cache
+							// if k == 8, cache is full, immediately store in global hash table
+							k = STOREINCACHE(tgt_state, cache, &bi);
+						} else {
+							i = 1;
 						}
-						store_cache_overflow_warp(d_q, d_newstate_flags, i == 0 && k == 8);
 					}
-				} else {
-					break;
+					store_cache_overflow_warp(d_q, d_newstate_flags, i == 0 && k == 8);
 				}
+			} else {
+				break;
 			}
+		}
+		while (CONTINUE != 2 && __any(offset1 < offset2 || cont)) {
 
 			// i is the current relative position in the buffer for this thread
 			i = 0;
 			if (offset1 < offset2 && !cont) {
+				tmp = tex1Dfetch(tex_proc_trans, offset1);
 				GETPROCTRANSACT(act, tmp);
 				// store transition entry
 				THREADBUFFERGROUPPOS(GROUP_ID,i) = tmp;
@@ -993,6 +986,10 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 					else {
 						break;
 					}
+				}
+				while(i < d_max_buf_ints) {
+					THREADBUFFERGROUPPOS(GROUP_ID,i) = 0;
+					i++;
 				}
 			}
 			int sync_act = cont ? act : (1 << d_bits_act);
