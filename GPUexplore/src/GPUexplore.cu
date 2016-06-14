@@ -779,8 +779,7 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 	inttype bitmask, bi;
 	int pos;
 	int tbgs = THREADBUFFERGROUPSTART(threadIdx.x);
-	// TODO: remove this
-	inttype TMPVAR;
+	// TODO
 	// is at least one outgoing transition enabled for a given state (needed to detect deadlocks)
 	inttype outtrans_enabled;
 
@@ -1019,14 +1018,20 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 			}
 			// iterate through the relevant syncbit filters
 			tmp = 1;
-			for (int j = GROUP_ID;__any(sync_offset1 + j / (INTSIZE/d_nr_procs) < sync_offset2 && tmp); j+=d_nr_procs) {
-				index = 0;
-				if(THREADINGROUP && sync_act < (1 << d_bits_act) && sync_offset1 + j / (INTSIZE/d_nr_procs) < sync_offset2 && tmp) {
+			for (int j = GROUP_ID;__any(sync_offset1 + j / (INTSIZE/d_nr_procs) < sync_offset2 && tmp);) {
+
+				tmp = 0;
+				while(THREADINGROUP && !(tmp != 0 && (tmp & proc_enabled) == tmp) && sync_offset1 + j / (INTSIZE/d_nr_procs) < sync_offset2) {
 					index = tex1Dfetch(tex_syncbits, sync_offset1 + j / (INTSIZE/d_nr_procs));
+					GETSYNCRULE(tmp, index, j % (INTSIZE/d_nr_procs));
+					j += d_nr_procs - __popc((__ballot(tmp != 0 && (tmp & proc_enabled) == tmp) >> (LANE - GROUP_ID)) & ((1 << GROUP_ID) - 1));
 				}
-				SETOLDSTATE(tgt_state);
+				if(THREADINGROUP && j >= d_nr_procs - 1 && THREADGROUPCOUNTER < j) {
+					atomicMax((inttype*) &THREADGROUPCOUNTER, j);
+				}
+
+				int work_remaining = 0;
 				int has_second_succ = 0;
-				GETSYNCRULE(tmp, index, j % (INTSIZE/d_nr_procs));
 				if (tmp != 0 && (tmp & proc_enabled) == tmp) {
 					// source state is not a deadlock
 					outtrans_enabled = 1;
@@ -1050,12 +1055,12 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 						}
 						rule &= ~(1 << pos);
 					}
-					SETNEWSTATE(tgt_state);
+					work_remaining = 1 + has_second_succ;
 				}
 				// while we keep getting new states, store them
-				while (__any(ISNEWSTATE(tgt_state))) {
-					l = k = TMPVAR = bitmask = 0;
-					if(ISNEWSTATE(tgt_state)) {
+				while (__any(work_remaining)) {
+					l = 0;
+					if(work_remaining) {
 						// check for violation of safety property, if required
 						if (d_property == SAFETY) {
 							GETSTATEVECTORSTATE(pos, tgt_state, d_nr_procs-1);
@@ -1067,15 +1072,14 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 
 						// store tgt_state in cache; if i == d_shared_q_size, state was found, duplicate detected
 						// if i == d_shared_q_size+1, cache is full, immediately store in global hash table
-						TMPVAR = STOREINCACHE(tgt_state, cache, &bitmask);
-						l = 1;
-						k = has_second_succ;
-						if(!has_second_succ) {
-							SETOLDSTATE(tgt_state);
+						l = STOREINCACHE(tgt_state, cache, &bitmask);
+						if(work_remaining == 1) {
+							// There will be no second successor
+							work_remaining = 0;
 						}
 					}
-					store_cache_overflow_warp(d_q, d_newstate_flags, l && TMPVAR == 8);
-					if(k) {
+					store_cache_overflow_warp(d_q, d_newstate_flags, l == 8);
+					if(work_remaining) {
 						// get next successor
 						int rule;
 						for (rule = tmp; rule;) {
@@ -1083,37 +1087,21 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 							int curr_st;
 							GETSTATEVECTORSTATE(curr_st, tgt_state, pos);
 							int st = 0;
-							for (k = 0; k < d_max_buf_ints; k++) {
-								for (l = 0; l < NR_OF_STATES_IN_TRANSENTRY(pos); l++) {
-									GETPROCTRANSSTATE(st, THREADBUFFERGROUPPOS(pos,k), l, pos);
-									if (curr_st == (st-1)) {
-										break;
-									}
-								}
-								if (curr_st == (st-1)) {
+							int num_states_in_trans = NR_OF_STATES_IN_TRANSENTRY(pos);
+							for (k = 0; k < d_max_buf_ints * num_states_in_trans; k++) {
+								GETPROCTRANSSTATE(st, THREADBUFFERGROUPPOS(pos,k / num_states_in_trans), k % num_states_in_trans, pos);
+								if (curr_st == (st-1) || st == 0) {
 									break;
 								}
 							}
 							// Assumption: element has been found (otherwise, 'last' was not a valid successor)
 							// Try to get the next element
-							if (l == NR_OF_STATES_IN_TRANSENTRY(pos) - 1) {
-								if (k >= d_max_buf_ints-1) {
-									st = 0;
-								}
-								else {
-									k++;
-									l = 0;
-								}
-							}
-							else {
-								l++;
-							}
+							k++;
 							// Retrieve next element, insert it in 'tgt_state' if it is not 0, and return result, otherwise continue
-							if (st != 0) {
-								GETPROCTRANSSTATE(st, THREADBUFFERGROUPPOS(pos,k), l, pos);
+							if (k < d_max_buf_ints * num_states_in_trans && st != 0) {
+								GETPROCTRANSSTATE(st, THREADBUFFERGROUPPOS(pos,k / num_states_in_trans), k % num_states_in_trans, pos);
 								if (st > 0) {
 									SETSTATEVECTORSTATE(tgt_state, pos, st-1);
-									SETNEWSTATE(tgt_state);
 									break;
 								}
 							}
@@ -1124,15 +1112,18 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 						}
 						// did we find a successor? if not, set tgt_state to old
 						if (rule == 0) {
-							SETOLDSTATE(tgt_state);
+							work_remaining = 0;
 						}
 					}
 				}
+
+				j = THREADGROUPCOUNTER + GROUP_ID + 1;
 			}
 
 			// only active threads should reset 'cont'
 			if (cont && sync_act == act) {
 				cont = 0;
+				THREADGROUPCOUNTER = 0;
 			}
 		}
 
