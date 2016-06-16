@@ -797,7 +797,7 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		STATESIZE(i) = d_bits_state[i];
 	}
 	// Clean the cache
-	for (i = threadIdx.x; i < (d_shared_q_size - CACHEOFFSET); i += blockDim.x) {
+	for (i = threadIdx.x; i < (d_shared_q_size - (cache-shared)); i += blockDim.x) {
 		cache[i] = EMPTYVECT32;
 	}
 	if(scan) {
@@ -889,7 +889,6 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 			shared[i] = 0;
 		}
 		if (THREADINGROUP) {
-			act = 1 << d_bits_act;
 			// Is there work?
 			if (ISSTATE(src_state)) {
 				// Gather the required transition information for all states in the tile
@@ -919,7 +918,7 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		// loop over all transentries
 		while (1) {
 			i = 1;
-			if(offset1 < offset2  && !cont) {
+			if(offset1 < offset2) {
 				tmp = tex1Dfetch(tex_proc_trans, offset1);
 				GETPROCTRANSSYNC(i, tmp);
 			}
@@ -963,6 +962,7 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 				break;
 			}
 		}
+		act = 1 << d_bits_act;
 		while (CONTINUE != 2 && __any(offset1 < offset2 || cont)) {
 
 			// i is the current relative position in the buffer for this thread
@@ -992,9 +992,11 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 					i++;
 				}
 			}
-			int sync_act = cont ? act : (1 << d_bits_act);
-			for(i = 1; i < d_nr_procs; i<<=1) {
-				sync_act = min(__shfl(sync_act, GTL((GROUP_ID + i) % d_nr_procs)), sync_act);
+			int sync_act = act;
+			if ((__ballot(cont) >> (LANE - GROUP_ID)) & ((1 << d_nr_procs) - 1)) {
+				for(i = 1; i < d_nr_procs; i<<=1) {
+					sync_act = min(__shfl(sync_act, GTL((GROUP_ID + i) % d_nr_procs)), sync_act);
+				}
 			}
 			// Now, we have obtained the info needed to combine process transitions
 			sync_offset1 = sync_offset2 = 0;
@@ -1085,17 +1087,19 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 							GETSTATEVECTORSTATE(curr_st, tgt_state, pos);
 							int st = 0;
 							int num_states_in_trans = NR_OF_STATES_IN_TRANSENTRY(pos);
-							for (k = 0; k < d_max_buf_ints * num_states_in_trans; k++) {
+							// We search for the position of the current state in the buffer
+							// We don't have to compare the last position: if curr_st has not been found yet,
+							// then it has to be in the last position
+							for (k = 0; k < d_max_buf_ints * num_states_in_trans - 1; k++) {
 								GETPROCTRANSSTATE(st, THREADBUFFERGROUPPOS(pos,k / num_states_in_trans), k % num_states_in_trans, pos);
 								if (curr_st == (st-1) || st == 0) {
 									break;
 								}
 							}
-							// Assumption: element has been found (otherwise, 'last' was not a valid successor)
 							// Try to get the next element
 							k++;
-							// Retrieve next element, insert it in 'tgt_state' if it is not 0, and return result, otherwise continue
 							if (k < d_max_buf_ints * num_states_in_trans && st != 0) {
+								// Retrieve next element, insert it in 'tgt_state' if it is not 0, and return result, otherwise continue
 								GETPROCTRANSSTATE(st, THREADBUFFERGROUPPOS(pos,k / num_states_in_trans), k % num_states_in_trans, pos);
 								if (st > 0) {
 									SETSTATEVECTORSTATE(tgt_state, pos, st-1);
@@ -1103,11 +1107,13 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 								}
 							}
 							// else, set this process state to first one, and continue to next process
-							GETPROCTRANSSTATE(st, THREADBUFFERGROUPPOS(pos,0), 0, pos);
-							SETSTATEVECTORSTATE(tgt_state, pos, st-1);
+							if (d_max_buf_ints * num_states_in_trans > 1) {
+								GETPROCTRANSSTATE(st, THREADBUFFERGROUPPOS(pos,0), 0, pos);
+								SETSTATEVECTORSTATE(tgt_state, pos, st-1);
+							}
 							rule &= ~(1 << pos);
 						}
-						// did we find a successor? if not, set tgt_state to old
+						// did we find a successor? if not, all successors have been generated
 						if (rule == 0) {
 							work_remaining = 0;
 						}
@@ -1120,6 +1126,7 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 			// only active threads should reset 'cont'
 			if (cont && sync_act == act) {
 				cont = 0;
+				act = 1 << d_bits_act;
 				THREADGROUPCOUNTER = 0;
 			}
 		}
@@ -1146,10 +1153,7 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 		}
 		int performed_work = OPENTILECOUNT != 0;
 		__syncthreads();
-		// Reset the open queue tile
-		if (threadIdx.x < OPENTILELEN) {
-			shared[OPENTILEOFFSET+threadIdx.x] = EMPTYVECT32;
-		}
+		// Reset the work tile count
 		if (threadIdx.x == 0) {
 			OPENTILECOUNT = 0;
 		}
@@ -1159,6 +1163,10 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 			copy_cache_to_global(d_q, cache, d_newstate_flags);
 		}
 		__syncthreads();
+		// Write empty state vector to part of the work tile that is not used
+		if (threadIdx.x < OPENTILELEN - OPENTILECOUNT) {
+			shared[OPENTILEOFFSET+OPENTILECOUNT+threadIdx.x] = EMPTYVECT32;
+		}
 		// Ready to start next iteration, if error has not occurred
 		if (threadIdx.x == 0) {
 			if (CONTINUE == 2) {
