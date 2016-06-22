@@ -1887,8 +1887,7 @@ int main(int argc, char** argv) {
 	fp = fopen(fn, "r");
 	if (fp) {
 		// Read the input
-		fgets(stmp, BUFFERSIZE, fp);
-		if (check_property == SAFETY) {
+		if (fgets(stmp, BUFFERSIZE, fp) != NULL && check_property == SAFETY) {
 			i = atoi(stmp);
 			fprintf(stdout, "Property to check is ");
 			if (i == 0) {
@@ -1899,72 +1898,89 @@ int main(int argc, char** argv) {
 				check_property = LIVENESS;
 			}
 		}
-		fgets(stmp, BUFFERSIZE, fp);
-		nr_procs = atoi(stmp);
-		fprintf(stdout, "nr of procs: %d\n", nr_procs);
-		fgets(stmp, BUFFERSIZE, fp);
-		bits_act = atoi(stmp);
-		fprintf(stdout, "nr of bits for transition label: %d\n", bits_act);
-		fgets(stmp, BUFFERSIZE, fp);
-		proc_nrstates = atoi(stmp);
-		fprintf(stdout, "min. nr. of proc. states that fit in 32-bit integer: %d\n", proc_nrstates);
-		fgets(stmp, BUFFERSIZE, fp);
-		bits_statevector = atoi(stmp) + apply_por;
-		fprintf(stdout, "number of bits needed for a state vector: %d\n", bits_statevector);
+		if (fgets(stmp, BUFFERSIZE, fp) != NULL) {
+			nr_procs = atoi(stmp);
+			fprintf(stdout, "nr of procs: %d\n", nr_procs);
+		}
+		if (fgets(stmp, BUFFERSIZE, fp) != NULL) {
+			bits_act = atoi(stmp);
+			fprintf(stdout, "nr of bits for transition label: %d\n", bits_act);
+		}
+		if (fgets(stmp, BUFFERSIZE, fp) != NULL) {
+			proc_nrstates = atoi(stmp);
+			fprintf(stdout, "min. nr. of proc. states that fit in 32-bit integer: %d\n", proc_nrstates);
+		}
+		if (fgets(stmp, BUFFERSIZE, fp) != NULL) {
+			bits_statevector = atoi(stmp) + apply_por;
+			fprintf(stdout, "number of bits needed for a state vector: %d\n", bits_statevector);
+		}
 		firstbit_statevector = (inttype*) malloc(sizeof(inttype)*(nr_procs+1));
 		for (int i = 0; i <= nr_procs; i++) {
-			fgets(stmp, BUFFERSIZE, fp);
-			firstbit_statevector[i] = atoi(stmp);
-			fprintf(stdout, "statevector offset %d: %d\n", i, firstbit_statevector[i]);
+			if (fgets(stmp, BUFFERSIZE, fp) != NULL) {
+				firstbit_statevector[i] = atoi(stmp);
+				fprintf(stdout, "statevector offset %d: %d\n", i, firstbit_statevector[i]);
+			}
 		}
 		// determine the number of integers needed for a state vector
 		sv_nints = (bits_statevector+31) / INTSIZE;
 		bits_state = (inttype*) malloc(sizeof(inttype)*nr_procs);
 		for (int i = 0; i < nr_procs; i++) {
-			fgets(stmp, BUFFERSIZE, fp);
-			bits_state[i] = atoi(stmp);
-			fprintf(stdout, "bits for states of process LTS %d: %d\n", i, bits_state[i]);
+			if (fgets(stmp, BUFFERSIZE, fp) != NULL) {
+				bits_state[i] = atoi(stmp);
+				fprintf(stdout, "bits for states of process LTS %d: %d\n", i, bits_state[i]);
+			}
 		}
-		fgets(stmp, BUFFERSIZE, fp);
-		nbits_offset = atoi(stmp);
-		fprintf(stdout, "size of offset in process LTSs: %d\n", nbits_offset);
-		fgets(stmp, BUFFERSIZE, fp);
-		max_buf_ints = atoi(stmp);
-		fprintf(stdout, "maximum label-bounded branching factor: %d\n", max_buf_ints);
+		if (fgets(stmp, BUFFERSIZE, fp) != NULL) {
+			nbits_offset = atoi(stmp);
+			fprintf(stdout, "size of offset in process LTSs: %d\n", nbits_offset);
+		}
+		if (fgets(stmp, BUFFERSIZE, fp) != NULL) {
+			max_buf_ints = atoi(stmp);
+			fprintf(stdout, "maximum label-bounded branching factor: %d\n", max_buf_ints);
+		}
 		proc_offsets_start = (inttype*) malloc(sizeof(inttype)*(nr_procs+1));
 		for (int i = 0; i <= nr_procs; i++) {
-			fgets(stmp, BUFFERSIZE, fp);
-			proc_offsets_start[i] = atoi(stmp);
+			if (fgets(stmp, BUFFERSIZE, fp) != NULL) {
+				proc_offsets_start[i] = atoi(stmp);
+			}
 		}
 		proc_offsets = (inttype*) malloc(sizeof(inttype)*proc_offsets_start[nr_procs]);
 		for (int i = 0; i < proc_offsets_start[nr_procs]; i++) {
-			fgets(stmp, BUFFERSIZE, fp);
-			proc_offsets[i] = atoi(stmp);
+			if (fgets(stmp, BUFFERSIZE, fp) != NULL) {
+				proc_offsets[i] = atoi(stmp);
+			}
 		}
-		fgets(stmp, BUFFERSIZE, fp);
-		nr_trans = atoi(stmp);
-		fprintf(stdout, "total number of transition entries in network: %d\n", nr_trans);
+		if (fgets(stmp, BUFFERSIZE, fp) != NULL) {
+			nr_trans = atoi(stmp);
+			fprintf(stdout, "total number of transition entries in network: %d\n", nr_trans);
+		}
 		proc_trans = (inttype*) malloc(sizeof(inttype)*nr_trans);
 		for (int i = 0; i < nr_trans; i++) {
-			fgets(stmp, BUFFERSIZE, fp);
-			proc_trans[i] = atoi(stmp);
+			if (fgets(stmp, BUFFERSIZE, fp) != NULL) {
+				proc_trans[i] = atoi(stmp);
+			}
 		}
 
-		fgets(stmp, BUFFERSIZE, fp);
-		nbits_syncbits_offset = atoi(stmp);
-		fgets(stmp, BUFFERSIZE, fp);
-		nr_syncbits_offsets = atoi(stmp);
+		if (fgets(stmp, BUFFERSIZE, fp) != NULL) {
+			nbits_syncbits_offset = atoi(stmp);
+		}
+		if (fgets(stmp, BUFFERSIZE, fp) != NULL) {
+			nr_syncbits_offsets = atoi(stmp);
+		}
 		syncbits_offsets = (inttype*) malloc(sizeof(inttype)*nr_syncbits_offsets);
 		for (int i = 0; i < nr_syncbits_offsets; i++) {
-			fgets(stmp, BUFFERSIZE, fp);
-			syncbits_offsets[i] = atoi(stmp);
+			if (fgets(stmp, BUFFERSIZE, fp) != NULL) {
+				syncbits_offsets[i] = atoi(stmp);
+			}
 		}
-		fgets(stmp, BUFFERSIZE, fp);
-		nr_syncbits = atoi(stmp);
+		if (fgets(stmp, BUFFERSIZE, fp) != NULL) {
+			nr_syncbits = atoi(stmp);
+		}
 		syncbits = (inttype*) malloc(sizeof(inttype)*nr_syncbits);
 		for (int i = 0; i < nr_syncbits; i++) {
-			fgets(stmp, BUFFERSIZE, fp);
-			syncbits[i] = atoi(stmp);
+			if (fgets(stmp, BUFFERSIZE, fp) != NULL) {
+				syncbits[i] = atoi(stmp);
+			}
 		}
 	}
 	else {
