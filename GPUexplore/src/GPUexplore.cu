@@ -42,7 +42,7 @@ enum PropertyStatus { NONE, DEADLOCK, SAFETY, LIVENESS };
 static const int WARPSIZE = 32;
 static const int HALFWARPSIZE = 16;
 static const int INTSIZE = 32;
-static const int BUFFERSIZE = 50;
+static const int BUFFERSIZE = 256;
 
 // GPU constants
 __constant__ inttype d_nrbuckets;
@@ -1742,7 +1742,7 @@ int main(int argc, char** argv) {
 	inttype nr_procs, bits_act, bits_statevector, sv_nints, nr_trans, proc_nrstates, nbits_offset, max_buf_ints, nr_syncbits_offsets, nr_syncbits, nbits_syncbits_offset;
 	inttype *bits_state, *firstbit_statevector, *proc_offsets, *proc_trans, *proc_offsets_start, *syncbits_offsets, *syncbits;
 	inttype contBFS, counted_states;
-	char stmp[BUFFERSIZE], fn[50];
+	char stmp[BUFFERSIZE], fn[BUFFERSIZE];
 	// to store constants for closed set hash functions
 	int h[NR_HASH_FUNCTIONS*2];
 	// size of global hash table
