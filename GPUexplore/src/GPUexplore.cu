@@ -324,7 +324,7 @@ __device__ void MARKINCACHE(volatile inttype* t, inttype* cache, int markNew) {
 														hashtmp <<= 5; \
 													} \
 													hashtmp = (indextype) (d_h[0]*hashtmp+d_h[1]); \
-													(a) = WARPSIZE*((inttype) ((hashtmp % P) % d_nrbuckets)); \
+													(a) = WARPSIZE*((inttype)(hashtmp % P) % d_nrbuckets); \
 												}
 #define FIRSTHASHHOST(a)						{	indextype hashtmp = 0; \
 													hashtmp = (indextype) h[1]; \
@@ -336,7 +336,7 @@ __device__ void MARKINCACHE(volatile inttype* t, inttype* cache, int markNew) {
 														hashtmp <<= 5; \
 													} \
 													hashtmp = (indextype) (shared[HASHCONSTANTSOFFSET+(2*(i))]*(hashtmp)+shared[HASHCONSTANTSOFFSET+(2*(i))+1]); \
-													(a) = WARPSIZE*((inttype) ((hashtmp % P) % d_nrbuckets)); \
+													(a) = WARPSIZE*((inttype)(hashtmp % P) % d_nrbuckets); \
 												}
 #define HASHFUNCTION(a, i, t)					((HASHALL((a), (i), (t))))
 
@@ -374,6 +374,7 @@ __device__ inttype LANE_POINTS_TO_EL(inttype i)	{
 __device__ inttype FINDORPUT_WARP(inttype* t, inttype* d_q, volatile inttype* d_newstate_flags, inttype claim_work)	{
 	inttype bi, bj, bk, bl, bitmask;
 	indextype hashtmp;
+	inttype hash;
 	BucketEntryStatus threadstatus;
 	// prepare bitmask once to reason about results of threads in the same (state vector) group
 	bitmask = 0;
@@ -381,8 +382,8 @@ __device__ inttype FINDORPUT_WARP(inttype* t, inttype* d_q, volatile inttype* d_
 		SETBITS(LANE-ENTRY_ID, LANE-ENTRY_ID+d_sv_nints, bitmask);
 	}
 	for (bi = 0; bi < NR_HASH_FUNCTIONS; bi++) {
-		HASHFUNCTION(hashtmp, bi, t);
-		bl = d_q[hashtmp+LANE];
+		HASHFUNCTION(hash, bi, t);
+		bl = d_q[hash+LANE];
 		bk = __ballot(STRIPPEDENTRY(bl, ENTRY_ID) == STRIPPEDSTATE(t, ENTRY_ID));
 		// threadstatus is used to determine whether full state vector has been found
 		threadstatus = EMPTY;
@@ -406,7 +407,7 @@ __device__ inttype FINDORPUT_WARP(inttype* t, inttype* d_q, volatile inttype* d_
 			// write the state vector
 			bk--;
 			if (LANE >= bk && LANE < bk+d_sv_nints) {
-				bl = atomicCAS(&(d_q[hashtmp+LANE]), EMPTYVECT32, t[ENTRY_ID]);
+				bl = atomicCAS(&(d_q[hash+LANE]), EMPTYVECT32, t[ENTRY_ID]);
 				if (bl == EMPTYVECT32) {
 					// success
 					if (ENTRY_ID == d_sv_nints-1) {
@@ -417,11 +418,11 @@ __device__ inttype FINDORPUT_WARP(inttype* t, inttype* d_q, volatile inttype* d_
 					if (ENTRY_ID == d_sv_nints-1) {
 						// try to increment the OPENTILECOUNT counter
 						if (claim_work && (bl = atomicAdd((inttype *) &OPENTILECOUNT, d_sv_nints)) < OPENTILELEN) {
-							d_q[hashtmp+LANE] = t[d_sv_nints-1];
+							d_q[hash+LANE] = t[d_sv_nints-1];
 						} else {
 							// There is work available for some block
 							__threadfence();
-							d_newstate_flags[(hashtmp / blockDim.x) % gridDim.x] = 1;
+							d_newstate_flags[(hash / blockDim.x) % gridDim.x] = 1;
 						}
 					}
 					// all active threads read the OPENTILECOUNT value of the last thread, and possibly store their part of the vector in the shared memory
@@ -559,11 +560,11 @@ void print_statevector(FILE* stream, inttype *state, inttype *firstbit_statevect
 	for (i = 0; i < nr_procs; i++) {
 		bitmask = 0;
 		if (firstbit_statevector[i]/INTSIZE == firstbit_statevector[i+1]/INTSIZE) {
-			SETBITS(firstbit_statevector[i] % INTSIZE,firstbit_statevector[i+1] % INTSIZE, bitmask);
+			bitmask = (((1<<(firstbit_statevector[i+1] % INTSIZE))-1)^((1<<(firstbit_statevector[i] % INTSIZE))-1));
 			s = (state[firstbit_statevector[i]/INTSIZE] & bitmask) >> (firstbit_statevector[i] % INTSIZE);
 		}
 		else {
-			SETBITS(0, firstbit_statevector[i+1] % INTSIZE, bitmask);
+			bitmask = 1 << (firstbit_statevector[i+1] % INTSIZE);
 			s = (state[firstbit_statevector[i]/INTSIZE] >> (firstbit_statevector[i] % INTSIZE)
 					| (state[firstbit_statevector[i+1]/INTSIZE] & bitmask) << (INTSIZE - (firstbit_statevector[i] % INTSIZE))); \
 		}
@@ -678,7 +679,7 @@ __global__ void init_queue(inttype *d_q, inttype n_elem) {
  * CUDA kernel to store initial state in hash table
  */
 __global__ void store_initial(inttype *d_q, inttype *d_h, inttype *d_newstate_flags, inttype blockdim, inttype griddim) {
-	inttype bj;
+	inttype bj, hash;
 	indextype hashtmp;
 	inttype state[MAX_SIZE];
 
@@ -686,11 +687,11 @@ __global__ void store_initial(inttype *d_q, inttype *d_h, inttype *d_newstate_fl
 		state[bj] = 0;
 	}
 	SETNEWSTATE(state);
-	FIRSTHASH(hashtmp, state);
+	FIRSTHASH(hash, state);
 	for (bj = 0; bj < d_sv_nints; bj++) {
-		d_q[hashtmp+bj] = state[bj];
+		d_q[hash+bj] = state[bj];
 	}
-	d_newstate_flags[(hashtmp / blockdim) % griddim] = 1;
+	d_newstate_flags[(hash / blockdim) % griddim] = 1;
 }
 
 /**
