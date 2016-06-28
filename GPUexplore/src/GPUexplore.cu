@@ -1005,17 +1005,15 @@ gather(inttype *d_q, const inttype *d_h, const inttype *d_bits_state,
 				pos = sync_act - (i*(INTSIZE/d_nbits_syncbits_offset));
 				l = tex1Dfetch(tex_syncbits_offsets, i);
 				GETSYNCOFFSET(sync_offset1, l, pos);
-				if (pos == (INTSIZE/d_nbits_syncbits_offset)-1) {
+				pos++;
+				if (pos == (INTSIZE/d_nbits_syncbits_offset)) {
 					l = tex1Dfetch(tex_syncbits_offsets, i+1);
-					GETSYNCOFFSET(sync_offset2, l, 0);
+					pos = 0;
 				}
-				else {
-					GETSYNCOFFSET(sync_offset2, l, pos+1);
-				}
+				GETSYNCOFFSET(sync_offset2, l, pos);
 			}
 			// iterate through the relevant syncbit filters
-			tmp = 1;
-			for (int j = GROUP_ID;__any(sync_offset1 + j / (INTSIZE/d_nr_procs) < sync_offset2 && tmp);) {
+			for (int j = GROUP_ID;__any(sync_offset1 + j / (INTSIZE/d_nr_procs) < sync_offset2);) {
 
 				tmp = 0;
 				while(THREADINGROUP && !(tmp != 0 && (tmp & proc_enabled) == tmp) && sync_offset1 + j / (INTSIZE/d_nr_procs) < sync_offset2) {
@@ -1045,10 +1043,11 @@ gather(inttype *d_q, const inttype *d_h, const inttype *d_bits_state,
 						GETPROCTRANSSTATE(k, THREADBUFFERGROUPPOS(pos,0), 0, pos);
 						SETSTATEVECTORSTATE(tgt_state, pos, k-1);
 						GETPROCTRANSSTATE(k, THREADBUFFERGROUPPOS(pos,0), 1, pos);
-						has_second_succ |= k;
 						if(d_max_buf_ints > 1 && !k) {
 							GETPROCTRANSSTATE(k, THREADBUFFERGROUPPOS(pos,1), 0, pos);
-							has_second_succ |= k;
+						}
+						if(k) {
+							has_second_succ |= 1 << pos;
 						}
 						rule &= ~(1 << pos);
 					}
@@ -1079,7 +1078,7 @@ gather(inttype *d_q, const inttype *d_h, const inttype *d_bits_state,
 					if(work_remaining) {
 						// get next successor
 						int rule;
-						for (rule = tmp; rule;) {
+						for (rule = has_second_succ; rule;) {
 							pos = __ffs(rule) - 1;
 							int curr_st;
 							GETSTATEVECTORSTATE(curr_st, tgt_state, pos);
