@@ -768,11 +768,9 @@ __device__ void copy_cache_to_global(inttype *d_q, inttype* cache, volatile intt
  */
 __global__ void
 __launch_bounds__(512, 2)
-gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
-						inttype *d_firstbit_statevector, inttype *d_proc_offsets_start,
-						inttype *d_proc_offsets, inttype *d_proc_trans, inttype *d_syncbits_offsets,
-						inttype *d_syncbits, inttype *d_contBFS, inttype *d_property_violation,
-						volatile inttype *d_newstate_flags, inttype *d_worktiles, inttype scan) {
+gather(inttype *d_q, const inttype *d_h, const inttype *d_bits_state,
+						const inttype *d_firstbit_statevector, inttype *d_contBFS, inttype *d_property_violation,
+						volatile inttype *d_newstate_flags, inttype *d_worktiles, const inttype scan) {
 	inttype i, k, l, index, offset1, offset2, tmp, cont, act, sync_offset1, sync_offset2;
 	volatile inttype* src_state = &shared[OPENTILEOFFSET+d_sv_nints*GROUP_GID];
 	volatile inttype* tgt_state = &shared[TGTSTATEOFFSET+threadIdx.x*d_sv_nints];
@@ -878,7 +876,6 @@ gather(inttype *d_q, inttype *d_h, inttype *d_bits_state,
 			} else {
 				WORKSCANRESULT = 0;
 			}
-			scan = 0;
 		}
 		// is the thread part of an 'active' group?
 		offset1 = 0;
@@ -2114,8 +2111,8 @@ int main(int argc, char** argv) {
 			gather_por<<<nblocks, nthreadsperblock, shared_q_size*sizeof(inttype)>>>(d_q, d_h, d_bits_state, d_firstbit_statevector, d_proc_offsets_start,
 																		d_proc_offsets, d_proc_trans, d_syncbits_offsets, d_syncbits, d_contBFS, d_property_violation, d_newstate_flags, d_worktiles, scan);
 		} else {
-			gather<<<nblocks, nthreadsperblock, shared_q_size*sizeof(inttype)>>>(d_q, d_h, d_bits_state, d_firstbit_statevector, d_proc_offsets_start,
-																		d_proc_offsets, d_proc_trans, d_syncbits_offsets, d_syncbits, d_contBFS, d_property_violation, d_newstate_flags, d_worktiles, scan);
+			gather<<<nblocks, nthreadsperblock, shared_q_size*sizeof(inttype)>>>(d_q, d_h, d_bits_state, d_firstbit_statevector,
+																		d_contBFS, d_property_violation, d_newstate_flags, d_worktiles, scan);
 		}
 		// copy progress result
 		//CUDA_CHECK_RETURN(cudaGetLastError());
