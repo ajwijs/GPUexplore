@@ -159,35 +159,22 @@ const size_t Mb = 1<<20;
 #define GETPROCTRANSSTATE(a, t, i, j)			GETBITS(a, t, 1+d_bits_act+(i)*STATESIZE(j), STATESIZE(j))
 #define GETTRANSOFFSET(a, t, i)					GETBITS(a, t, (i)*d_nbits_offset, d_nbits_offset)
 #define GETSYNCOFFSET(a, t, i)					GETBITS(a, t, (i)*d_nbits_syncbits_offset, d_nbits_syncbits_offset)
-//GETBITS(a, (t)[shared[VECTORPOSOFFSET+(i)]/INTSIZE], \
-//		shared[VECTORPOSOFFSET+(i)] % INTSIZE, shared[LTSSTATESIZEOFFSET+(i)]);
-#define GETSTATEVECTORSTATE(a, t, i)			{bitmask = 0; 	if (VECTORSTATEPOS(i)/INTSIZE == (VECTORSTATEPOS((i)+1)-1)/INTSIZE) { \
-																	SETBITS((VECTORSTATEPOS(i) % INTSIZE), \
-																			(((VECTORSTATEPOS((i)+1)-1) % INTSIZE)+1), bitmask); \
-																	(a) = ((t)[VECTORSTATEPOS(i)/INTSIZE] & bitmask) >> (VECTORSTATEPOS(i) % INTSIZE); \
-																} \
-																else { \
-																	SETBITS(0,(VECTORSTATEPOS((i)+1) % INTSIZE),bitmask); \
-																	(a) = (t)[VECTORSTATEPOS(i)/INTSIZE] >> (VECTORSTATEPOS(i) % INTSIZE) \
-																		 | \
-																		((t)[VECTORSTATEPOS((i)+1)/INTSIZE] & bitmask) << \
-																		(INTSIZE - (VECTORSTATEPOS(i) % INTSIZE)); \
-																} \
+#define GETSTATEVECTORSTATE(b, t, i)			{ asm("{\n\t" \
+												  	  " .reg .u64 t1;\n\t" \
+												  	  " mov.b64 t1,{%1,%2};\n\t" \
+												  	  " bfe.u64 t1, t1, %3, %4;\n\t" \
+												  	  " cvt.u32.u64 %0,t1;\n\t" \
+													  "}" : "=r"(b) : "r"((t)[VECTORSTATEPOS(i)/INTSIZE]), "r"(VECTORSTATEPOS(i)/INTSIZE == (VECTORSTATEPOS((i)+1)-1)/INTSIZE ? 0 : (t)[VECTORSTATEPOS(i)/INTSIZE+1]), \
+														  	"r"(VECTORSTATEPOS(i)%INTSIZE), "r"(VECTORSTATEPOS(i+1)-VECTORSTATEPOS(i))); \
 												}
-#define SETSTATEVECTORSTATE(t, i, x)			{bitmask = 0; 	if (VECTORSTATEPOS(i)/INTSIZE == (VECTORSTATEPOS((i)+1)-1)/INTSIZE) { \
-																	SETBITS((VECTORSTATEPOS(i) % INTSIZE), \
-																			(((VECTORSTATEPOS((i)+1)-1) % INTSIZE)+1),bitmask); \
-																	(t)[VECTORSTATEPOS(i)/INTSIZE] = ((t)[VECTORSTATEPOS(i)/INTSIZE] & ~bitmask) | \
-																	((x) << (VECTORSTATEPOS(i) % INTSIZE)); \
-																} \
-																else { \
-																	SETBITS(0,(VECTORSTATEPOS(i) % INTSIZE), bitmask); \
-																	(t)[VECTORSTATEPOS(i)/INTSIZE] = ((t)[VECTORSTATEPOS(i)/INTSIZE] & bitmask) | \
-																	((x) << (VECTORSTATEPOS(i) % INTSIZE)); \
-																	bitmask = -1 << (VECTORSTATEPOS((i)+1) % INTSIZE); \
-																	(t)[VECTORSTATEPOS((i)+1)/INTSIZE] = ((t)[VECTORSTATEPOS((i)+1)/INTSIZE] & bitmask) | \
-																		((x) >> (INTSIZE - (VECTORSTATEPOS(i) % INTSIZE))); \
-																} \
+#define SETSTATEVECTORSTATE(t, i, x)			{ asm("bfi.b32 %0, %1, %0, %2, %3;" \
+													  : "+r"((t)[VECTORSTATEPOS(i)/INTSIZE]) : \
+														"r"(x), "r"(VECTORSTATEPOS(i)%INTSIZE), "r"(VECTORSTATEPOS((i)+1)-VECTORSTATEPOS(i))); \
+												  if (VECTORSTATEPOS(i)/INTSIZE != (VECTORSTATEPOS((i)+1)-1)/INTSIZE) { \
+													  asm("bfi.b32 %0, %1, %0, %2, %3;" \
+													  : "+r"((t)[VECTORSTATEPOS(i+1)/INTSIZE]) : \
+														"r"((x)>>(INTSIZE - (VECTORSTATEPOS(i) % INTSIZE))), "r"(0), "r"(VECTORSTATEPOS((i)+1) % INTSIZE)); \
+												  } \
 												}
 // NEEDS FIX: USE BIT 32 OF FIRST INTEGER TO INDICATE STATE OR NOT (1 or 0), IN CASE MULTIPLE INTEGERS ARE USED FOR STATE VECTOR!!!
 //#define ISSTATE(t)								((t)[(d_sv_nints-1)] != EMPTYVECT32)
