@@ -1990,6 +1990,7 @@ int main(int argc, char** argv) {
 	cudaGetDeviceProperties(&prop, 0);
 	fprintf (stdout, "global mem: %lu\n", (uint64_t) prop.totalGlobalMem);
 	fprintf (stdout, "shared mem per block: %d\n", (int) prop.sharedMemPerBlock);
+	fprintf (stdout, "shared mem per SM: %d\n", (int) prop.sharedMemPerMultiprocessor);
 	fprintf (stdout, "max. threads per block: %d\n", (int) prop.maxThreadsPerBlock);
 	fprintf (stdout, "max. grid size: %d\n", (int) prop.maxGridSize[0]);
 	fprintf (stdout, "nr. of multiprocessors: %d\n", (int) prop.multiProcessorCount);
@@ -2052,7 +2053,7 @@ int main(int argc, char** argv) {
 
 	fprintf (stdout, "global mem queue size: %lu, number of entries: %lu\n", q_size*sizeof(inttype), (indextype) q_size);
 
-	inttype shared_q_size = (int) prop.sharedMemPerBlock / sizeof(inttype);
+	inttype shared_q_size = (int) prop.sharedMemPerMultiprocessor / sizeof(inttype) / 2;
 	fprintf (stdout, "shared mem queue size: %lu, number of entries: %u\n", shared_q_size*sizeof(inttype), shared_q_size);
 	fprintf (stdout, "nr. of blocks: %d, block size: %d, nr of kernel iterations: %d\n", nblocks, nthreadsperblock, kernel_iters);
 
