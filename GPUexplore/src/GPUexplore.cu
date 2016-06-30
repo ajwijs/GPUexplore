@@ -769,13 +769,15 @@ gather(inttype *d_q, const inttype *d_h, const inttype *d_bits_state,
 	// is at least one outgoing transition enabled for a given state (needed to detect deadlocks)
 	inttype outtrans_enabled;
 
-	// Locally store the state sizes and syncbits
+	// Reset the shared variables
 	if (threadIdx.x < SH_OFFSET) {
 		shared[threadIdx.x] = 0;
 	}
+	// Load the hash constants into shared memory
 	for (i = threadIdx.x; i < HASHCONSTANTSLEN; i += blockDim.x) {
 		shared[i+HASHCONSTANTSOFFSET] = d_h[i];
 	}
+	// Load the state sizes and offsets into shared memory
 	for (i = threadIdx.x; i < VECTORPOSLEN; i += blockDim.x) {
 		VECTORSTATEPOS(i) = d_firstbit_statevector[i];
 	}
@@ -844,6 +846,7 @@ gather(inttype *d_q, const inttype *d_h, const inttype *d_bits_state,
 				last_search_location = 0;
 			}
 			if(LANE == 0) {
+				// Store the last search location, so we can continue from that point later on
 				shared[LASTSEARCHOFFSET + WARP_ID] = last_search_location;
 			}
 			if(found_new_state || i < d_nrbuckets) {
@@ -894,13 +897,10 @@ gather(inttype *d_q, const inttype *d_h, const inttype *d_bits_state,
 				}
 			}
 		}
-		// iterate over the outgoing transitions of state 'cont'
-		// variable cont is reused to indicate whether the buffer content of this thread still needs processing
+		// variable cont is used to indicate whether the buffer content of this thread still needs processing
 		cont = 0;
-		// while there is work to be done
 		outtrans_enabled = 0;
-		// if not sync, store in hash table
-		// loop over all transentries
+		// First, generate successors following from local actions
 		while (1) {
 			i = 1;
 			if(offset1 < offset2) {
@@ -947,12 +947,16 @@ gather(inttype *d_q, const inttype *d_h, const inttype *d_bits_state,
 				break;
 			}
 		}
+		// Now there are only synchronizing actions left
 		act = 1 << d_bits_act;
+		// While the hash table is not full and there are transitions left,
+		// explore those transitions
 		while (CONTINUE != 2 && __any(offset1 < offset2 || cont)) {
 
 			// i is the current relative position in the buffer for this thread
 			i = 0;
 			if (offset1 < offset2 && !cont) {
+				// Fill the buffer with transitions with the same action label
 				tmp = tex1Dfetch(tex_proc_trans, offset1);
 				GETPROCTRANSACT(act, tmp);
 				// store transition entry
@@ -972,6 +976,7 @@ gather(inttype *d_q, const inttype *d_h, const inttype *d_bits_state,
 						break;
 					}
 				}
+				// Clear the rest of the buffer
 				while(i < d_max_buf_ints) {
 					THREADBUFFERGROUPPOS(GROUP_ID,i) = 0;
 					i++;
@@ -979,13 +984,16 @@ gather(inttype *d_q, const inttype *d_h, const inttype *d_bits_state,
 			}
 			int sync_act = act;
 			if ((__ballot(cont) >> (LANE - GROUP_ID)) & ((1 << d_nr_procs) - 1)) {
+				// Find the smallest 'sync_act' with butterfly reduction
 				for(i = 1; i < d_nr_procs; i<<=1) {
 					sync_act = min(__shfl(sync_act, GTL((GROUP_ID + i) % d_nr_procs)), sync_act);
 				}
 			}
 			// Now, we have obtained the info needed to combine process transitions
 			sync_offset1 = sync_offset2 = 0;
+			// Find out which processes have the smallest 'act'
 			int proc_enabled = (__ballot(act == sync_act) >> (LANE - GROUP_ID)) & ((1 << d_nr_procs) - 1);
+			// Only generate synchronizing successors if there are more that two processes with 'sync_act' enabled
 			if(THREADINGROUP && sync_act < (1 << d_bits_act) && (__popc(proc_enabled) >= 2)) {
 				// syncbits Offset position
 				i = sync_act/(INTSIZE/d_nbits_syncbits_offset);
@@ -1003,22 +1011,25 @@ gather(inttype *d_q, const inttype *d_h, const inttype *d_bits_state,
 			for (int j = GROUP_ID;__any(sync_offset1 + j / (INTSIZE/d_nr_procs) < sync_offset2);) {
 
 				tmp = 0;
+				// Keep searching the array with sync rules until we have found an applicable rule or we have reached the end
 				while(THREADINGROUP && !(tmp != 0 && (tmp & proc_enabled) == tmp) && sync_offset1 + j / (INTSIZE/d_nr_procs) < sync_offset2) {
+					// Fetch the rule
 					index = tex1Dfetch(tex_syncbits, sync_offset1 + j / (INTSIZE/d_nr_procs));
 					GETSYNCRULE(tmp, index, j % (INTSIZE/d_nr_procs));
+					// Increase the counter such that threads that have not found an applicable sync rule take a smaller step
 					j += d_nr_procs - __popc((__ballot(tmp != 0 && (tmp & proc_enabled) == tmp) >> (LANE - GROUP_ID)) & ((1 << GROUP_ID) - 1));
 				}
+				// Find the smallest index j for the next iteration
 				if(THREADINGROUP && j >= d_nr_procs - 1 && THREADGROUPCOUNTER < j) {
 					atomicMax((inttype*) &THREADGROUPCOUNTER, j);
 				}
 
 				int work_remaining = 0;
 				int has_second_succ = 0;
+				// start combining entries in the buffer to create target states
 				if (tmp != 0 && (tmp & proc_enabled) == tmp) {
 					// source state is not a deadlock
 					outtrans_enabled = 1;
-					// start combining entries in the buffer to create target states
-					// if sync rule applicable, construct the first successor
 					// copy src_state into tgt_state
 					for (pos = 0; pos < d_sv_nints; pos++) {
 						tgt_state[pos] = src_state[pos];
@@ -1029,6 +1040,7 @@ gather(inttype *d_q, const inttype *d_h, const inttype *d_bits_state,
 						// get first state
 						GETPROCTRANSSTATE(k, THREADBUFFERGROUPPOS(pos,0), 0, pos);
 						SETSTATEVECTORSTATE(tgt_state, pos, k-1);
+						// Check if this buffer has a second state
 						GETPROCTRANSSTATE(k, THREADBUFFERGROUPPOS(pos,0), 1, pos);
 						if(d_max_buf_ints > 1 && !k) {
 							GETPROCTRANSSTATE(k, THREADBUFFERGROUPPOS(pos,1), 0, pos);
@@ -1063,7 +1075,8 @@ gather(inttype *d_q, const inttype *d_h, const inttype *d_bits_state,
 					}
 					store_cache_overflow_warp(d_q, d_newstate_flags, l == 8);
 					if(work_remaining) {
-						// get next successor
+						// get next successor by finding the next combination from the buffer
+						// Only look at processes that stored more than one successor in the buffer (has_second_succ)
 						int rule;
 						for (rule = has_second_succ; rule;) {
 							pos = __ffs(rule) - 1;
