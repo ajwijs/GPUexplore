@@ -977,11 +977,17 @@ gather(inttype *d_q, const inttype *d_h, const inttype *d_bits_state,
 				}
 			}
 			int sync_act = act;
-			if ((__ballot(cont) >> (LANE - GROUP_ID)) & ((1 << d_nr_procs) - 1)) {
+			if (__popc((__ballot(cont) >> (LANE - GROUP_ID)) & ((1 << d_nr_procs) - 1)) > 1) {
 				// Find the smallest 'sync_act' with butterfly reduction
 				for(int j = 1; j < d_nr_procs; j<<=1) {
 					sync_act = min(__shfl(sync_act, GTL((GROUP_ID + j) % d_nr_procs)), sync_act);
 				}
+			} else {
+				// Only one process with synchronizing transitions left, there will
+				// be no more successors from this state
+				cont = 0;
+				offset1 = offset2;
+				sync_act = 1 << d_bits_act;
 			}
 			// Now, we have obtained the info needed to combine process transitions
 			sync_offset1 = sync_offset2 = 0;
