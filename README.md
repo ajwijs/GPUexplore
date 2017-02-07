@@ -24,3 +24,26 @@ The input models in gpf format can be generated from EXP models. Several example
 Branches
 --------
 Since it is very hard to merge the three different implementations of partial-order reduction without duplicating code, there are three separate branches. `ample-por` contains a POR implementation based on the ample-set approach, `cample-por` uses the cluster-based ample-set approach and `stubborn-por` computes the reduction based on stubborn sets.
+
+Publications
+--------
+Anton Wijs, Thomas Neele, Dragan Bosnacki:
+GPUexplore 2.0: Unleashing GPU Explicit-State Model Checking. FM 2016: 694-701
+
+Thomas Neele, Anton Wijs, Dragan Bosnacki, Jaco van de Pol:
+Partial-Order Reduction for GPU Model Checking. ATVA 2016: 357-374
+
+Anton Wijs:
+BFS-Based Model Checking of Linear-Time Properties with an Application on GPUs. CAV (2) 2016: 472-493
+
+Anton Wijs, Dragan Bosnacki:
+Many-core on-the-fly model checking of safety properties using GPUs. STTT 18(2): 169-185 (2016)
+
+Anton Wijs, Dragan Bosnacki:
+GPUexplore: Many-Core On-the-Fly State Space Exploration Using GPUs. TACAS 2014: 233-247
+
+
+Previous versions
+--------
+The code that was used can be found in commit `8afb22476d894300e6b3c870f7160203760328a5` for `ample-por`, `9b87c2d940586ece89d8f6166f93e4f309f74eba` for `cample-por` and `8399bcc0f33ae6743c10c8e9f5654a8783eae455` for `stubborn-por`.
+The version of the code that was used for the ATVA2016 paper has been tagged with `atva2016` in all three POR branches. Since then, we have mainly developed the cample-set version. The resulting code was used for the FM2016 publication. This commit has been tagged in the `cample-por` branch.
