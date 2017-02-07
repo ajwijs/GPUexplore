@@ -45,5 +45,4 @@ GPUexplore: Many-Core On-the-Fly State Space Exploration Using GPUs. TACAS 2014:
 
 Previous versions
 --------
-The code that was used can be found in commit `8afb22476d894300e6b3c870f7160203760328a5` for `ample-por`, `9b87c2d940586ece89d8f6166f93e4f309f74eba` for `cample-por` and `8399bcc0f33ae6743c10c8e9f5654a8783eae455` for `stubborn-por`.
 The version of the code that was used for the ATVA2016 paper has been tagged with `atva2016` in all three POR branches. Since then, we have mainly developed the cample-set version. The resulting code was used for the FM2016 publication. This commit has been tagged in the `cample-por` branch.
