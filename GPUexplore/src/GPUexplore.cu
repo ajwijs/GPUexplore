@@ -1837,7 +1837,7 @@ int main(int argc, char** argv) {
 		}
 		else if (!strcmp(argv[i],"-q")) {
 			// store hash table size
-			q_size = atoi(argv[i+1]);
+			q_size = atoll(argv[i+1]);
 			i += 2;
 		}
 		else if (!strcmp(argv[i],"-v")) {
